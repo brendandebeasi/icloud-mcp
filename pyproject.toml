@@ -16,6 +16,10 @@ dependencies = [
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[project.scripts]
+icloud-mcp = "icloud_mcp.server:run"
+icloud-mcp-http = "icloud_mcp.server:run_http"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",

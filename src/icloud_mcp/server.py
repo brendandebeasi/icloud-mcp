@@ -612,17 +612,24 @@ def apply_category_filter(server: FastMCP, raw: str | None = None) -> frozenset[
 # ============================================================================
 
 def run():
-    """Run the MCP server."""
-    from .config import config as app_config
+    """Run the MCP server with stdio transport."""
     apply_category_filter(mcp)
     mcp.run(transport="stdio")
 
 
 def run_http():
-    """Run the MCP server with HTTP transport."""
+    """Run the MCP server with Streamable HTTP transport.
+
+    Honors PORT (or MCP_SERVER_PORT) and HOST env vars. Defaults bind to
+    127.0.0.1 so the server is loopback-only unless the operator explicitly
+    sets HOST=0.0.0.0 for a containerized/exposed deployment.
+    """
+    import os as _os
     from .config import config as app_config
+    port = int(_os.environ.get("PORT", app_config.MCP_SERVER_PORT))
+    host = _os.environ.get("HOST", "127.0.0.1")
     apply_category_filter(mcp)
-    mcp.run(transport="sse", port=app_config.MCP_SERVER_PORT)
+    mcp.run(transport="http", host=host, port=port, path="/mcp")
 
 
 if __name__ == "__main__":
