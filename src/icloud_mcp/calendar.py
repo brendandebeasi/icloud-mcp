@@ -10,6 +10,7 @@ from email.mime.text import MIMEText
 from fastmcp import Context
 from .auth import require_auth
 from .config import config
+from .html_render import render as _render_html
 
 
 def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
@@ -251,11 +252,11 @@ async def list_events(
 
                     result.append({
                         "id": str(event.url),
-                        "summary": str(vevent.summary.value) if hasattr(vevent, 'summary') and vevent.summary else "",
-                        "description": str(vevent.description.value) if hasattr(vevent, 'description') and vevent.description else "",
+                        "summary": _render_html(str(vevent.summary.value)) if hasattr(vevent, 'summary') and vevent.summary else "",
+                        "description": _render_html(str(vevent.description.value)) if hasattr(vevent, 'description') and vevent.description else "",
                         "start": start_value,
                         "end": end_value,
-                        "location": str(vevent.location.value) if hasattr(vevent, 'location') and vevent.location else "",
+                        "location": _render_html(str(vevent.location.value)) if hasattr(vevent, 'location') and vevent.location else "",
                         "calendar": calendar.name or "Unknown",
                         "url": str(event.url)
                     })

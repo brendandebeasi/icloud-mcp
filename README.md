@@ -102,6 +102,18 @@ SMTP_SERVER=smtp.mail.me.com
 MCP_SERVER_PORT=8000
 IMAP_PORT=993
 SMTP_PORT=587
+
+# HTML Rendering Mode for free-text fields (optional — defaults to markdown)
+# Calendar event description/location and contact notes/addresses can carry
+# embedded HTML (e.g. "Reynier Park<br>2803 Reynier Ave..."). Choose how the
+# server returns these fields:
+#   markdown — convert <br>, <a>, <b>, <i>, <ul>/<li> to Markdown (default,
+#              best LLM ergonomics, links survive as [text](url))
+#   strip    — drop tags, decode entities, plain text (smallest tokens)
+#   raw      — return verbatim, do not touch (lossless passthrough)
+# Email message bodies are NEVER rendered through this — IMAP exposes
+# text/html parts separately and the agent picks per-call.
+ICLOUD_HTML_MODE=markdown
 ```
 
 ### Authentication
