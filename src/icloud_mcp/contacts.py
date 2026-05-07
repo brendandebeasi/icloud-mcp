@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 from fastmcp import Context
 from .auth import require_auth
 from .config import config
+from .html_render import render as _render_html
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
 import uuid
@@ -203,31 +204,37 @@ async def list_contacts(
                 
                 # Extract name
                 if hasattr(vcard, 'fn') and vcard.fn and hasattr(vcard.fn, 'value'):
-                    contact["name"] = str(vcard.fn.value)
-                
+                    contact["name"] = _render_html(str(vcard.fn.value))
+
                 # Extract phone numbers
                 if hasattr(vcard, 'tel_list'):
                     for tel in vcard.tel_list:
                         if hasattr(tel, 'value') and tel.value:
                             contact["phones"].append(str(tel.value))
-                
+
                 # Extract emails
                 if hasattr(vcard, 'email_list'):
                     for em in vcard.email_list:
                         if hasattr(em, 'value') and em.value:
                             contact["emails"].append(str(em.value))
-                
-                # Extract addresses
+
+                # Extract addresses (free-text label component can contain HTML)
                 if hasattr(vcard, 'adr_list'):
                     for adr in vcard.adr_list:
                         if hasattr(adr, 'value'):
                             try:
                                 addr_str = str(adr.value) if adr.value else ""
                                 if addr_str:
-                                    contact["addresses"].append(addr_str)
+                                    contact["addresses"].append(_render_html(addr_str))
                             except Exception as _e:
                                 continue
-                
+
+                # Extract free-text notes (rich-text-prone field)
+                if hasattr(vcard, 'note') and vcard.note and hasattr(vcard.note, 'value'):
+                    note_str = _render_html(str(vcard.note.value))
+                    if note_str:
+                        contact["note"] = note_str
+
                 # Only add contact if it has a name or at least one other field
                 if contact["name"] or contact["phones"] or contact["emails"]:
                     result.append(contact)
@@ -264,30 +271,36 @@ async def get_contact(context: Context, contact_id: str) -> Dict[str, Any]:
         
         contact = {
             "id": contact_id,
-            "name": str(vcard.fn.value) if hasattr(vcard, 'fn') else "",
+            "name": _render_html(str(vcard.fn.value)) if hasattr(vcard, 'fn') else "",
             "phones": [],
             "emails": [],
             "addresses": [],
-            "organization": str(vcard.org.value[0]) if hasattr(vcard, 'org') and vcard.org.value else "",
-            "title": str(vcard.title.value) if hasattr(vcard, 'title') else "",
+            "organization": _render_html(str(vcard.org.value[0])) if hasattr(vcard, 'org') and vcard.org.value else "",
+            "title": _render_html(str(vcard.title.value)) if hasattr(vcard, 'title') else "",
             "url": contact_id
         }
-        
+
         # Extract phone numbers
         if hasattr(vcard, 'tel_list'):
             for tel in vcard.tel_list:
                 contact["phones"].append(str(tel.value))
-        
+
         # Extract emails
         if hasattr(vcard, 'email_list'):
             for em in vcard.email_list:
                 contact["emails"].append(str(em.value))
-        
+
         # Extract addresses
         if hasattr(vcard, 'adr_list'):
             for adr in vcard.adr_list:
-                contact["addresses"].append(str(adr.value))
-        
+                contact["addresses"].append(_render_html(str(adr.value)))
+
+        # Extract free-text notes (rich-text-prone field)
+        if hasattr(vcard, 'note') and vcard.note and hasattr(vcard.note, 'value'):
+            note_str = _render_html(str(vcard.note.value))
+            if note_str:
+                contact["note"] = note_str
+
         return contact
     
     except Exception as e:
