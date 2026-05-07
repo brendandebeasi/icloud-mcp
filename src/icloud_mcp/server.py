@@ -531,18 +531,97 @@ async def email_mark_unread(
 
 
 # ============================================================================
+# Tool category filter
+# ============================================================================
+
+# Tool-name prefix → category. Categories are also the values accepted in the
+# ICLOUD_ENABLED_CATEGORIES env var. "mail" is accepted as an alias for "email".
+_CATEGORY_PREFIXES = {
+    "calendar": "calendar_",
+    "contacts": "contacts_",
+    "email": "email_",
+}
+_CATEGORY_ALIASES = {"mail": "email"}
+_ALL_CATEGORIES = frozenset(_CATEGORY_PREFIXES)
+
+
+def _resolve_enabled_categories(raw: str | None) -> frozenset[str]:
+    """Parse ICLOUD_ENABLED_CATEGORIES into a normalized category set.
+
+    Empty / unset → all categories enabled (preserves legacy behavior).
+    Unknown tokens are ignored (with no error) so a typo can't lock the
+    operator out of every tool — but at least one valid category must
+    resolve, otherwise we treat it as "all" too.
+    """
+    if not raw:
+        return _ALL_CATEGORIES
+    requested = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    resolved = {_CATEGORY_ALIASES.get(t, t) for t in requested}
+    valid = resolved & _ALL_CATEGORIES
+    return frozenset(valid) if valid else _ALL_CATEGORIES
+
+
+def apply_category_filter(server: FastMCP, raw: str | None = None) -> frozenset[str]:
+    """Remove tools whose category is not in ICLOUD_ENABLED_CATEGORIES.
+
+    Returns the set of categories that remained enabled. Idempotent: a second
+    call with the same value finds no matching tools left to remove.
+    """
+    import os as _os
+    import asyncio as _asyncio
+
+    enabled = _resolve_enabled_categories(
+        raw if raw is not None else _os.environ.get("ICLOUD_ENABLED_CATEGORIES")
+    )
+    if enabled == _ALL_CATEGORIES:
+        return enabled
+
+    disabled_prefixes = tuple(
+        prefix for cat, prefix in _CATEGORY_PREFIXES.items() if cat not in enabled
+    )
+
+    # FastMCP exposes registered tools via async list_tools() on the local
+    # provider; removal is sync. Snapshot first, then mutate.
+    provider = server.local_provider
+    try:
+        tools = _asyncio.run(provider.list_tools())
+    except RuntimeError:
+        # Already inside an event loop (rare for startup paths but possible
+        # under embedding). Schedule on a fresh loop in a worker thread.
+        import threading
+        result: list = []
+        def _runner():
+            result.append(_asyncio.new_event_loop().run_until_complete(provider.list_tools()))
+        t = threading.Thread(target=_runner)
+        t.start()
+        t.join()
+        tools = result[0] if result else []
+
+    for tool in tools:
+        if tool.name.startswith(disabled_prefixes):
+            try:
+                provider.remove_tool(tool.name)
+            except KeyError:
+                pass
+
+    return enabled
+
+
+# ============================================================================
 # Server Entrypoint
 # ============================================================================
 
 def run():
     """Run the MCP server."""
     from .config import config as app_config
+    apply_category_filter(mcp)
     mcp.run(transport="stdio")
 
 
 def run_http():
     """Run the MCP server with HTTP transport."""
     from .config import config as app_config
+    apply_category_filter(mcp)
     mcp.run(transport="sse", port=app_config.MCP_SERVER_PORT)
 
 

@@ -31,12 +31,15 @@ def main():
     # Import after parsing to allow --help without dependencies
     try:
         # Try installed package first (for Docker/production)
-        from icloud_mcp.server import mcp
+        from icloud_mcp.server import mcp, apply_category_filter
         from icloud_mcp.config import config
     except ImportError:
         # Fall back to development mode
-        from src.icloud_mcp.server import mcp
+        from src.icloud_mcp.server import mcp, apply_category_filter
         from src.icloud_mcp.config import config
+
+    enabled = apply_category_filter(mcp)
+    print(f"iCloud MCP categories enabled: {sorted(enabled)}", file=sys.stderr)
 
     if args.http:
         port = args.port or int(os.environ.get("PORT", config.MCP_SERVER_PORT))

@@ -102,7 +102,29 @@ SMTP_SERVER=smtp.mail.me.com
 MCP_SERVER_PORT=8000
 IMAP_PORT=993
 SMTP_PORT=587
+
+# Tool Categories (optional — defaults to all three)
+# Comma-separated subset of: calendar, contacts, mail (mail is an alias for email)
+# Tools whose category is not listed are removed from the registry at startup
+# and will not appear in list_tools or be callable. Empty / unset / all-invalid
+# values fall back to enabling every category.
+ICLOUD_ENABLED_CATEGORIES=calendar,contacts,mail
 ```
+
+### Tool Categories
+
+Tools are grouped by name prefix:
+
+| Category | Tool prefix | Tools |
+|---|---|---|
+| `calendar` | `calendar_` | List, create, update, delete, search calendar events; list calendars |
+| `contacts` | `contacts_` | List, get, create, update, delete, search contacts |
+| `email` (alias `mail`) | `email_` | List folders/messages, get, search, send, move, delete, mark read/unread |
+
+Set `ICLOUD_ENABLED_CATEGORIES` to a comma-separated subset to expose only
+those tools — useful when running multiple server instances backed by
+different Apple IDs and you want each instance scoped to a specific surface
+(e.g. one calendar-only instance, one mail-only instance).
 
 ### Authentication
 
