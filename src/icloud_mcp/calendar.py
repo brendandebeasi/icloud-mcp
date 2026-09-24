@@ -23,6 +23,8 @@ from dateutil.rrule import rrulestr
 
 from .auth import require_auth
 from .config import config
+from .mail_utils import clean_rich_text
+from .urls import ensure_icloud_url
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +51,8 @@ def _client_for_url(url: str, email: str, password: str) -> caldav.DAVClient:
     (``https://p72-caldav.icloud.com/...``). Using the generic
     ``caldav.icloud.com`` client for those URLs breaks URL joining.
     """
+    url = ensure_icloud_url(url, "calendar/event")
     parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(
-            f"Expected a full calendar/event URL from calendar_list_calendars "
-            f"or calendar_list_events, got: {url!r}"
-        )
     return caldav.DAVClient(
         url=f"{parsed.scheme}://{parsed.netloc}", username=email, password=password
     )
@@ -195,6 +193,41 @@ def _attendee_emails(vevent: Any) -> list[str]:
     return result
 
 
+def _alarm_minutes(vevent: Any) -> list[int]:
+    """Minutes before start for each display/audio VALARM (negative = after start)."""
+    result = []
+    for alarm in getattr(vevent, "valarm_list", []) or []:
+        trigger = getattr(alarm, "trigger", None)
+        if trigger is None:
+            continue
+        value = trigger.value
+        if isinstance(value, timedelta):
+            related = (trigger.params.get("RELATED") or ["START"])[0].upper()
+            if related != "START":
+                continue
+            result.append(int(-value.total_seconds() // 60))
+    return result
+
+
+def _add_alarm(vevent: Any, minutes_before: int) -> None:
+    alarm = vevent.add("valarm")
+    alarm.add("action").value = "DISPLAY"
+    alarm.add("description").value = "Reminder"
+    alarm.add("trigger").value = timedelta(minutes=-int(minutes_before))
+
+
+def _alarm_lines(minutes_before: int) -> list[str]:
+    minutes = int(minutes_before)
+    sign = "-" if minutes > 0 else ""
+    return [
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:Reminder",
+        f"TRIGGER:{sign}PT{abs(minutes)}M",
+        "END:VALARM",
+    ]
+
+
 def _vevent_to_dict(vevent: Any, url: str, calendar_name: str) -> dict[str, Any]:
     def text(attr: str) -> str:
         prop = getattr(vevent, attr, None)
@@ -210,8 +243,8 @@ def _vevent_to_dict(vevent: Any, url: str, calendar_name: str) -> dict[str, Any]
         "id": url,
         "url": url,
         "summary": text("summary"),
-        "description": text("description"),
-        "location": text("location"),
+        "description": clean_rich_text(text("description")),
+        "location": clean_rich_text(text("location")),
         "start": _value_to_iso(start_value),
         "end": _value_to_iso(end_prop.value) if end_prop is not None else None,
         "all_day": all_day,
@@ -219,6 +252,7 @@ def _vevent_to_dict(vevent: Any, url: str, calendar_name: str) -> dict[str, Any]
         "end_timezone": _prop_tzid(end_prop) if end_prop is not None else "",
         "recurring": bool(rrule) or hasattr(vevent, "recurrence_id"),
         "rrule": rrule,
+        "reminders": _alarm_minutes(vevent),
         "attendees": _attendee_emails(vevent),
         "calendar": calendar_name,
     }
@@ -475,6 +509,7 @@ def create_event(
     calendar_id: str | None = None,
     timezone: str | None = None,
     rrule: str | None = None,
+    reminders: list[int] | None = None,
 ) -> dict[str, Any]:
     email, password = require_auth()
     client = _get_caldav_client(email, password)
@@ -539,6 +574,8 @@ def create_event(
                 f"ATTENDEE;CN={attendee_email};CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;"
                 f"PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee_email}"
             )
+    for minutes in reminders or []:
+        lines += _alarm_lines(minutes)
     lines += ["END:VEVENT", "END:VCALENDAR"]
     ical_data = "\n".join(lines)
 
@@ -565,6 +602,7 @@ def create_event(
         "location": location or "",
         "attendees": attendees or [],
         "rrule": rrule_line[len("RRULE:"):] if rrule_line else "",
+        "reminders": [int(m) for m in reminders or []],
         "calendar": calendar.name,
     }
     if failed:
@@ -624,6 +662,7 @@ def update_event(
     attendees: list[str] | None = None,
     timezone: str | None = None,
     rrule: str | None = None,
+    reminders: list[int] | None = None,
 ) -> dict[str, Any]:
     email, password = require_auth()
     client, event = _load_event(event_id, email, password)
@@ -688,6 +727,12 @@ def update_event(
             org = vevent.add("organizer")
             org.value = f"mailto:{email}"
             org.params["CN"] = [email]
+
+    if reminders is not None:
+        for alarm in list(getattr(vevent, "valarm_list", []) or []):
+            vevent.remove(alarm)
+        for minutes in reminders:
+            _add_alarm(vevent, minutes)
 
     # Bump SEQUENCE so clients treat iTIP updates as newer than the original.
     try:

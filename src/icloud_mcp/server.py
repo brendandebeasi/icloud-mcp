@@ -1,6 +1,7 @@
 """FastMCP server exposing iCloud Calendar, Contacts and Mail as MCP tools."""
 
 import argparse
+import hmac
 import logging
 import os
 from typing import Annotated, Any
@@ -13,7 +14,7 @@ from pydantic import Field
 
 from . import __version__, calendar, contacts
 from . import mail as mail_module
-from .auth import AuthenticationError
+from .auth import AuthenticationError, redact_secrets
 from .config import config, configure_logging
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,8 @@ Conventions:
 - Reminders lists appear as calendars with read_only=true; events cannot be created there.
 - Recurring events are expanded by calendar_list_events: each occurrence is a separate entry sharing the series id; update/delete affect the whole series.
 - Email bodies are converted to readable text and truncated to {config.EMAIL_BODY_MAX_CHARS} characters; use email_get_message with full_html=true for the raw HTML.
-- Sending mail, creating/updating/deleting events and contacts are irreversible: confirm the details with the user first when in doubt.
+- Sending mail, creating/updating/deleting events and contacts are irreversible: confirm the details with the user first when in doubt. Use email_save_draft when the user wants to review before sending.
+- Enabled tool groups: {", ".join(sorted(config.ENABLED_CATEGORIES))}.
 """
 
 mcp = FastMCP(
@@ -36,6 +38,13 @@ mcp = FastMCP(
     version=__version__,
     website_url="https://github.com/mike-tih/icloud-mcp",
 )
+
+def tool(category: str, **kwargs):
+    """Register a tool only when its category is enabled (ICLOUD_ENABLED_CATEGORIES)."""
+    if category not in config.ENABLED_CATEGORIES:
+        return lambda fn: fn
+    return mcp.tool(**kwargs)
+
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 WRITE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
@@ -62,19 +71,19 @@ def _run(fn, *args, **kwargs):
     except AuthenticationError as e:
         raise ToolError(f"Authentication required: {e}") from e
     except (PermissionError, FileNotFoundError, ValueError) as e:
-        raise ToolError(str(e)) from e
+        raise ToolError(redact_secrets(str(e))) from e
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else None
         if status in (401, 403):
             raise ToolError(f"HTTP {status}: {AUTH_HINT}") from e
-        raise ToolError(f"iCloud returned HTTP {status}: {e}") from e
+        raise ToolError(redact_secrets(f"iCloud returned HTTP {status}: {e}")) from e
     except Exception as e:
         name = type(e).__name__
         text = str(e)
         if "401" in text or "Unauthorized" in text or "AuthorizationError" in name:
             raise ToolError(f"{name}: {AUTH_HINT} ({text})") from e
         logger.exception("Tool failed: %s", fn.__name__)
-        raise ToolError(f"{name}: {text}") from e
+        raise ToolError(redact_secrets(f"{name}: {text}")) from e
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +124,14 @@ Rrule = Annotated[
         )
     ),
 ]
+Reminders = Annotated[
+    list[int] | None,
+    Field(description="Alerts as minutes before the event start, e.g. [60, 10]. 0 = at start; a negative value fires after the start (e.g. -540 = 09:00 on the day of an all-day event)."),
+]
 Attendees = Annotated[list[str] | None, Field(description="Attendee email addresses. Each receives an iTIP invitation by email.")]
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("calendar", annotations=READ_ONLY)
 def calendar_list_calendars() -> list[dict[str, Any]]:
     """List the account's calendars with their IDs (URLs).
 
@@ -127,7 +140,7 @@ def calendar_list_calendars() -> list[dict[str, Any]]:
     return _run(calendar.list_calendars)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("calendar", annotations=READ_ONLY)
 def calendar_list_events(
     calendar_id: CalendarId = None,
     start_date: Annotated[str | None, Field(description="Range start (YYYY-MM-DD or ISO datetime). Default: 90 days ago.")] = None,
@@ -143,7 +156,7 @@ def calendar_list_events(
     return _run(calendar.list_events, calendar_id, start_date, end_date)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("calendar", annotations=READ_ONLY)
 def calendar_search_events(
     query: Annotated[str, Field(description="Case-insensitive text matched against summary, description and location.")],
     calendar_id: CalendarId = None,
@@ -154,7 +167,7 @@ def calendar_search_events(
     return _run(calendar.search_events, query, calendar_id, start_date, end_date)
 
 
-@mcp.tool(annotations=WRITE)
+@tool("calendar", annotations=WRITE)
 def calendar_create_event(
     summary: Annotated[str, Field(description="Event title.")],
     start: Annotated[str, Field(description="Start: 'YYYY-MM-DDTHH:MM:SS' (interpreted in `timezone`) or 'YYYY-MM-DD' for an all-day event.")],
@@ -165,19 +178,20 @@ def calendar_create_event(
     calendar_id: CalendarId = None,
     timezone: Timezone = None,
     rrule: Rrule = None,
+    reminders: Reminders = None,
 ) -> dict[str, Any]:
-    """Create a calendar event (optionally recurring) and email iTIP invitations to attendees.
+    """Create a calendar event (optionally recurring, with alerts) and email iTIP invitations to attendees.
 
     Returns the created event including its id/url. If some invitations could not be sent,
     `invitations_failed` lists those addresses.
     """
     return _run(
         calendar.create_event,
-        summary, start, end, description, location, attendees, calendar_id, timezone, rrule,
+        summary, start, end, description, location, attendees, calendar_id, timezone, rrule, reminders,
     )
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@tool("calendar", annotations=DESTRUCTIVE)
 def calendar_update_event(
     event_id: EventId,
     summary: Annotated[str | None, Field(description="New title.")] = None,
@@ -188,15 +202,16 @@ def calendar_update_event(
     attendees: Annotated[list[str] | None, Field(description="New attendee list; replaces the existing one and sends updated invitations.")] = None,
     timezone: Annotated[str | None, Field(description="IANA timezone for the new start/end. Omit to keep the event's current timezone.")] = None,
     rrule: Annotated[str | None, Field(description="New recurrence rule for the whole series (e.g. 'FREQ=WEEKLY;BYDAY=TU'). Pass '' to make the event non-recurring.")] = None,
+    reminders: Annotated[list[int] | None, Field(description="New alerts as minutes before start (replaces existing alerts; [] removes all).")] = None,
 ) -> dict[str, Any]:
     """Update fields of an existing event. Only provided fields change; recurring series are updated as a whole."""
     return _run(
         calendar.update_event,
-        event_id, summary, start, end, description, location, attendees, timezone, rrule,
+        event_id, summary, start, end, description, location, attendees, timezone, rrule, reminders,
     )
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@tool("calendar", annotations=DESTRUCTIVE)
 def calendar_delete_event(event_id: EventId) -> dict[str, Any]:
     """Delete an event (the whole series for recurring events) and email cancellations to its attendees."""
     return _run(calendar.delete_event, event_id)
@@ -212,15 +227,15 @@ Emails = Annotated[list[str] | None, Field(description="Email addresses.")]
 Addresses = Annotated[list[str] | None, Field(description="Postal addresses, one string each.")]
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("contacts", annotations=READ_ONLY)
 def contacts_list(
     limit: Annotated[int | None, Field(description="Maximum number of contacts to return. Default: all.", ge=1)] = None,
 ) -> list[dict[str, Any]]:
-    """List contacts from the default address book: id/url, name, phones, emails, addresses, organization, title."""
+    """List contacts from the default address book: id/url, name, phones, emails, addresses, organization, title, notes."""
     return _run(contacts.list_contacts, limit)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("contacts", annotations=READ_ONLY)
 def contacts_search(
     query: Annotated[str, Field(description="Text matched against name, organization, emails and phone digits.")],
     limit: Annotated[int | None, Field(description="Maximum number of matches.", ge=1)] = None,
@@ -229,13 +244,13 @@ def contacts_search(
     return _run(contacts.search_contacts, query, limit)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("contacts", annotations=READ_ONLY)
 def contacts_get(contact_id: ContactId) -> dict[str, Any]:
     """Get one contact with all fields."""
     return _run(contacts.get_contact, contact_id)
 
 
-@mcp.tool(annotations=WRITE)
+@tool("contacts", annotations=WRITE)
 def contacts_create(
     name: Annotated[str, Field(description="Full name, e.g. 'Jane Doe'.")],
     phones: Phones = None,
@@ -243,12 +258,13 @@ def contacts_create(
     addresses: Addresses = None,
     organization: Annotated[str | None, Field(description="Company / organization.")] = None,
     title: Annotated[str | None, Field(description="Job title.")] = None,
+    notes: Annotated[str | None, Field(description="Free-text notes.")] = None,
 ) -> dict[str, Any]:
     """Create a contact in the default address book and return it with its id/url."""
-    return _run(contacts.create_contact, name, phones, emails, addresses, organization, title)
+    return _run(contacts.create_contact, name, phones, emails, addresses, organization, title, notes)
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@tool("contacts", annotations=DESTRUCTIVE)
 def contacts_update(
     contact_id: ContactId,
     name: Annotated[str | None, Field(description="New full name.")] = None,
@@ -257,12 +273,14 @@ def contacts_update(
     addresses: Annotated[list[str] | None, Field(description="New address list (replaces existing).")] = None,
     organization: Annotated[str | None, Field(description="New organization.")] = None,
     title: Annotated[str | None, Field(description="New job title.")] = None,
+    notes: Annotated[str | None, Field(description="New notes (empty string clears).")] = None,
 ) -> dict[str, Any]:
-    """Update a contact. Only provided fields change; list fields replace the existing values."""
-    return _run(contacts.update_contact, contact_id, name, phones, emails, addresses, organization, title)
+    """Update a contact. Only provided fields change; list fields replace the existing values
+    (entries that keep the same number/address keep their labels such as home/work)."""
+    return _run(contacts.update_contact, contact_id, name, phones, emails, addresses, organization, title, notes)
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@tool("contacts", annotations=DESTRUCTIVE)
 def contacts_delete(contact_id: ContactId) -> dict[str, str]:
     """Delete a contact permanently."""
     return _run(contacts.delete_contact, contact_id)
@@ -281,13 +299,13 @@ Limit = Annotated[int, Field(description="Maximum number of messages, newest fir
 IncludeBody = Annotated[bool, Field(description="Include body_text (readable text, truncated). Set false for a fast header-only listing.")]
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("email", annotations=READ_ONLY)
 def email_list_folders() -> list[dict[str, Any]]:
     """List mail folders with their IMAP flags (e.g. \\Sent, \\Trash)."""
     return _run(mail_module.list_folders)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("email", annotations=READ_ONLY)
 def email_list_messages(
     folder: Folder = "INBOX",
     limit: Limit = 50,
@@ -298,7 +316,7 @@ def email_list_messages(
     return _run(mail_module.list_messages, folder, limit, unread_only, include_body)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("email", annotations=READ_ONLY)
 def email_search(
     query: Annotated[str | None, Field(description="Text matched against Subject OR From.")] = None,
     sender: Annotated[str | None, Field(description="Text/address matched against From (full addresses work best).")] = None,
@@ -322,7 +340,7 @@ def email_search(
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("email", annotations=READ_ONLY)
 def email_get_message(
     message_id: MessageId,
     folder: Folder = "INBOX",
@@ -336,7 +354,7 @@ def email_get_message(
     return _run(mail_module.get_message, message_id, folder, include_body, full_html)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool("email", annotations=READ_ONLY)
 def email_get_messages(
     message_ids: Annotated[list[str], Field(description="Message IDs (IMAP UIDs) from the same folder.", min_length=1)],
     folder: Folder = "INBOX",
@@ -347,7 +365,7 @@ def email_get_messages(
     return _run(mail_module.get_messages, message_ids, folder, include_body, full_html)
 
 
-@mcp.tool(annotations=READ_ONLY, output_schema=None)
+@tool("email", annotations=READ_ONLY, output_schema=None)
 def email_get_attachment(
     message_id: MessageId,
     attachment: Annotated[str, Field(description="Attachment index ('1') or (partial) file name as listed by email_get_message.")],
@@ -377,7 +395,7 @@ def email_get_attachment(
     return [summary, File(data=data, format=mime.split("/", 1)[1] if "/" in mime else None, name=name)]
 
 
-@mcp.tool(annotations=WRITE)
+@tool("email", annotations=WRITE)
 def email_send(
     to: Annotated[str, Field(description="Recipient address(es), comma-separated.")],
     subject: Annotated[str, Field(description="Subject line.")],
@@ -399,7 +417,26 @@ def email_send(
     )
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@tool("email", annotations=WRITE)
+def email_save_draft(
+    subject: Annotated[str, Field(description="Subject line.")],
+    body: Annotated[str, Field(description="Message body (plain text, or HTML when html=true).")],
+    to: Annotated[str | None, Field(description="Recipient address(es), comma-separated. May be omitted for a draft.")] = None,
+    cc: Annotated[str | None, Field(description="CC address(es).")] = None,
+    bcc: Annotated[str | None, Field(description="BCC address(es).")] = None,
+    html: Annotated[bool, Field(description="Treat body as HTML.")] = False,
+    attachment_paths: Annotated[list[str] | None, Field(description="Local file paths to attach (see email_send).")] = None,
+    reply_to_message_id: Annotated[str | None, Field(description="UID of a message this draft replies to.")] = None,
+    reply_to_folder: Annotated[str, Field(description="Folder of reply_to_message_id.")] = "INBOX",
+) -> dict[str, Any]:
+    """Save a message to the Drafts folder without sending it, so the user can review and send it from any mail client."""
+    return _run(
+        mail_module.save_draft,
+        to, subject, body, cc, bcc, html, attachment_paths, reply_to_message_id, reply_to_folder,
+    )
+
+
+@tool("email", annotations=DESTRUCTIVE)
 def email_move(
     message_id: MessageId,
     from_folder: Annotated[str, Field(description="Current folder of the message.")],
@@ -409,7 +446,7 @@ def email_move(
     return _run(mail_module.move_message, message_id, from_folder, to_folder)
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@tool("email", annotations=DESTRUCTIVE)
 def email_delete(
     message_id: MessageId,
     folder: Folder = "INBOX",
@@ -419,13 +456,13 @@ def email_delete(
     return _run(mail_module.delete_message, message_id, folder, permanent)
 
 
-@mcp.tool(annotations=WRITE)
+@tool("email", annotations=WRITE)
 def email_mark_read(message_id: MessageId, folder: Folder = "INBOX") -> dict[str, str]:
     """Mark a message as read (set \\Seen)."""
     return _run(mail_module.mark_as_read, message_id, folder)
 
 
-@mcp.tool(annotations=WRITE)
+@tool("email", annotations=WRITE)
 def email_mark_unread(message_id: MessageId, folder: Folder = "INBOX") -> dict[str, str]:
     """Mark a message as unread (clear \\Seen)."""
     return _run(mail_module.mark_as_unread, message_id, folder)
@@ -434,6 +471,32 @@ def email_mark_unread(message_id: MessageId, folder: Folder = "INBOX") -> dict[s
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
+
+class TokenAuthMiddleware:
+    """Require a shared secret on every MCP request (``Authorization: Bearer`` or ``X-MCP-Token``)."""
+
+    def __init__(self, app, token: str, exempt_paths: tuple[str, ...] = ("/health",)):
+        self.app = app
+        self.token = token
+        self.exempt_paths = exempt_paths
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") in self.exempt_paths:
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+        presented = headers.get("x-mcp-token")
+        auth = headers.get("authorization", "")
+        if not presented and auth.lower().startswith("bearer "):
+            presented = auth[7:].strip()
+        if presented and hmac.compare_digest(presented, self.token):
+            await self.app(scope, receive, send)
+            return
+        from starlette.responses import JSONResponse
+
+        response = JSONResponse({"error": "unauthorized", "detail": "valid MCP_AUTH_TOKEN required"}, status_code=401)
+        await response(scope, receive, send)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -454,6 +517,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _http_credential_policy() -> list:
+    """Decide whether environment credentials may serve HTTP requests; build auth middleware.
+
+    Environment credentials are honoured over HTTP only when MCP_AUTH_TOKEN protects the
+    endpoint or the operator opted in with ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true.
+    """
+    has_env_creds = bool(config.FALLBACK_EMAIL and config.FALLBACK_PASSWORD)
+    allow_env = config.ALLOW_ENV_CREDENTIALS
+    if allow_env is None:
+        allow_env = bool(config.MCP_AUTH_TOKEN)
+    config.ENV_CREDENTIALS_ACTIVE = allow_env
+    if has_env_creds and not allow_env:
+        logger.warning(
+            "ICLOUD_EMAIL/ICLOUD_APP_SPECIFIC_PASSWORD are set but ignored over HTTP because the "
+            "endpoint is unprotected. Set MCP_AUTH_TOKEN, or ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true "
+            "to serve the environment account to anyone who can reach this port."
+        )
+    if not config.MCP_AUTH_TOKEN:
+        logger.warning("MCP_AUTH_TOKEN is not set: the HTTP endpoint accepts requests from anyone.")
+    middleware = []
+    if config.MCP_AUTH_TOKEN:
+        from starlette.middleware import Middleware
+
+        middleware.append(Middleware(TokenAuthMiddleware, token=config.MCP_AUTH_TOKEN))
+    return middleware
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     configure_logging(args.log_level)
@@ -466,6 +556,8 @@ def main(argv: list[str] | None = None) -> None:
         config.LOCAL_FILES = not use_http
 
     if use_http:
+        middleware = _http_credential_policy()
+
         logger.info(
             "Starting iCloud MCP %s on http://%s:%s%s (stateless=%s, local_files=%s)",
             __version__, args.host, args.port, args.path, not args.stateful, config.LOCAL_FILES,
@@ -478,6 +570,7 @@ def main(argv: list[str] | None = None) -> None:
             stateless_http=not args.stateful,
             show_banner=False,
             log_level=args.log_level.lower(),
+            middleware=middleware,
         )
     else:
         logger.info("Starting iCloud MCP %s on stdio (local_files=%s)", __version__, config.LOCAL_FILES)

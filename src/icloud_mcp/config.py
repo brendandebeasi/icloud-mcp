@@ -36,6 +36,31 @@ def _local_timezone_name() -> str:
     return "UTC"
 
 
+ALL_CATEGORIES = frozenset({"calendar", "contacts", "email"})
+
+
+def _parse_categories(raw: str | None) -> frozenset[str]:
+    """Parse ICLOUD_ENABLED_CATEGORIES ("calendar,contacts,email"; "mail" is an alias for email)."""
+    if raw is None or not raw.strip():
+        return ALL_CATEGORIES
+    result = set()
+    for item in raw.split(","):
+        name = item.strip().lower()
+        if not name:
+            continue
+        if name == "mail":
+            name = "email"
+        if name not in ALL_CATEGORIES:
+            raise ValueError(
+                f"Unknown category {item.strip()!r} in ICLOUD_ENABLED_CATEGORIES; "
+                f"use any of {', '.join(sorted(ALL_CATEGORIES))}"
+            )
+        result.add(name)
+    if not result:
+        raise ValueError("ICLOUD_ENABLED_CATEGORIES must enable at least one category")
+    return frozenset(result)
+
+
 class Config:
     """Server configuration, loaded once from the environment."""
 
@@ -56,6 +81,23 @@ class Config:
     # Mail folders (iCloud names; discovered via IMAP special-use flags when possible)
     SENT_FOLDER: str = os.getenv("SENT_FOLDER", "Sent Messages")
     TRASH_FOLDER: str = os.getenv("TRASH_FOLDER", "Deleted Messages")
+    DRAFTS_FOLDER: str = os.getenv("DRAFTS_FOLDER", "Drafts")
+
+    # Which tool groups to expose: any of calendar, contacts, email (alias: mail).
+    ENABLED_CATEGORIES: frozenset[str] = _parse_categories(os.getenv("ICLOUD_ENABLED_CATEGORIES"))
+
+    # How rich text stored in iCloud fields (event notes/location, contact notes)
+    # is returned: "text" renders HTML to readable text, "raw" leaves it untouched.
+    HTML_MODE: str = os.getenv("ICLOUD_HTML_MODE", "text").strip().lower()
+
+    # HTTP hardening. MCP_AUTH_TOKEN, when set, is required on every MCP request as
+    # ``Authorization: Bearer <token>`` or ``X-MCP-Token: <token>``. Environment
+    # credentials are honoured over HTTP only when a token protects the endpoint or
+    # ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true is set explicitly.
+    MCP_AUTH_TOKEN: str | None = os.getenv("MCP_AUTH_TOKEN") or None
+    ALLOW_ENV_CREDENTIALS: bool | None = _env_bool("ICLOUD_MCP_ALLOW_ENV_CREDENTIALS", None)
+    # Set at startup by server.main(); True unless disabled for an unprotected HTTP server.
+    ENV_CREDENTIALS_ACTIVE: bool = True
 
     # Size limits
     EMAIL_BODY_MAX_CHARS: int = int(os.getenv("EMAIL_BODY_MAX_CHARS", "20000"))

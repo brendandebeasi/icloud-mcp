@@ -58,10 +58,11 @@ def get_credentials() -> tuple[str, str]:
         email = email or basic_email
         password = password or basic_password
 
-    if not email:
-        email = config.FALLBACK_EMAIL
-    if not password:
-        password = config.FALLBACK_PASSWORD
+    if config.ENV_CREDENTIALS_ACTIVE:
+        if not email:
+            email = config.FALLBACK_EMAIL
+        if not password:
+            password = config.FALLBACK_PASSWORD
 
     if not email or not password:
         raise AuthenticationError(
@@ -78,3 +79,14 @@ def get_credentials() -> tuple[str, str]:
 def require_auth() -> tuple[str, str]:
     """Alias kept for readability at call sites."""
     return get_credentials()
+
+
+def redact_secrets(text: str) -> str:
+    """Remove the current request's password from a message before it leaves the server."""
+    try:
+        _, password = get_credentials()
+    except Exception:
+        return text
+    if password and password in text:
+        text = text.replace(password, "***")
+    return text

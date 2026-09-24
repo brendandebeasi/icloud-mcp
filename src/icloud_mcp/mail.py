@@ -12,7 +12,9 @@ from .auth import require_auth
 from .config import config
 from .mail_utils import (
     TRASH_CANDIDATES,
+    append_to_drafts,
     append_to_sent,
+    bare_addresses,
     build_attachment_parts,
     build_email_message,
     close_imap_client,
@@ -27,10 +29,11 @@ from .mail_utils import (
     list_attachments,
     message_summary,
     move_messages,
+    parse_recipients,
     permanently_delete,
     raw_message_from_data,
     resolve_local_path,
-    split_addresses,
+    validate_header_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -343,22 +346,24 @@ def get_attachment(
 # ---------------------------------------------------------------------------
 
 
-def send_message(
+def _compose(
+    username: str,
+    password: str,
     to: str,
     subject: str,
     body: str,
-    cc: str | None = None,
-    bcc: str | None = None,
-    html: bool = False,
-    attachment_paths: list[str] | None = None,
-    reply_to_message_id: str | None = None,
-    reply_to_folder: str = "INBOX",
-) -> dict[str, Any]:
-    username, password = require_auth()
-
-    to_list = split_addresses(to)
-    cc_list = split_addresses(cc)
-    bcc_list = split_addresses(bcc)
+    cc: str | None,
+    bcc: str | None,
+    html: bool,
+    attachment_paths: list[str] | None,
+    reply_to_message_id: str | None,
+    reply_to_folder: str,
+) -> tuple[Any, list[str], list[Any]]:
+    """Build the MIME message; returns (message, envelope recipients, attachment parts)."""
+    to_list = parse_recipients(to, "to")
+    cc_list = parse_recipients(cc, "cc")
+    bcc_list = parse_recipients(bcc, "bcc")
+    subject = validate_header_text(subject, "subject")
     if not to_list:
         raise ValueError("At least one recipient is required in 'to'")
 
@@ -384,7 +389,26 @@ def send_message(
             references.append(original_id)
             msg["References"] = " ".join(references)
 
-    recipients = to_list + cc_list + bcc_list
+    recipients = bare_addresses(to_list + cc_list + bcc_list)
+    return msg, recipients, parts
+
+
+def send_message(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+    attachment_paths: list[str] | None = None,
+    reply_to_message_id: str | None = None,
+    reply_to_folder: str = "INBOX",
+) -> dict[str, Any]:
+    username, password = require_auth()
+    msg, recipients, parts = _compose(
+        username, password, to, subject, body, cc, bcc, html, attachment_paths, reply_to_message_id, reply_to_folder
+    )
+
     with get_smtp_client(username, password) as smtp:
         smtp.send_message(msg, from_addr=username, to_addrs=recipients)
 
@@ -406,6 +430,60 @@ def send_message(
     if saved_to:
         result["saved_to_folder"] = saved_to
     return result
+
+
+def save_draft(
+    to: str | None,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+    attachment_paths: list[str] | None = None,
+    reply_to_message_id: str | None = None,
+    reply_to_folder: str = "INBOX",
+) -> dict[str, Any]:
+    """Store a message in Drafts without sending it (recipients may be empty)."""
+    username, password = require_auth()
+    to_list = parse_recipients(to, "to") if to else []
+    cc_list = parse_recipients(cc, "cc") if cc else []
+    bcc_list = parse_recipients(bcc, "bcc") if bcc else []
+    subject = validate_header_text(subject, "subject")
+
+    parts = build_attachment_parts(attachment_paths) if attachment_paths else []
+    msg = build_email_message(body, html, parts)
+    msg["From"] = username
+    if to_list:
+        msg["To"] = ", ".join(to_list)
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    if bcc_list:
+        msg["Bcc"] = ", ".join(bcc_list)
+
+    client = get_imap_client(username, password)
+    try:
+        if reply_to_message_id:
+            original, _ = fetch_message(client, reply_to_folder, reply_to_message_id)
+            original_id = original.get("Message-ID")
+            if original_id:
+                msg["In-Reply-To"] = original_id
+                references = (original.get("References") or "").split()
+                references.append(original_id)
+                msg["References"] = " ".join(references)
+        folder = append_to_drafts(client, msg.as_bytes())
+    finally:
+        close_imap_client(client)
+
+    return {
+        "status": "success",
+        "message": f"Draft saved to {folder}",
+        "folder": folder,
+        "to": bare_addresses(to_list),
+        "subject": subject,
+        "attachments": [p.get_filename() for p in parts],
+    }
 
 
 def move_message(message_id: str, from_folder: str, to_folder: str) -> dict[str, str]:

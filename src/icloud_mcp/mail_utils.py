@@ -14,6 +14,7 @@ import email.message
 import logging
 import mimetypes
 import os
+import re
 import smtplib
 from dataclasses import asdict, dataclass
 from email import encoders
@@ -21,6 +22,7 @@ from email.header import decode_header
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr, getaddresses, parseaddr
 from typing import Any
 
 from imapclient import IMAPClient
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 BODY_KEYS = (b"BODY[]", "BODY[]", b"RFC822", "RFC822", b"BODY.PEEK[]")
 SENT_CANDIDATES = ("Sent Messages", "Sent", "Sent Items", "Sent Mail")
 TRASH_CANDIDATES = ("Deleted Messages", "Trash", "Deleted Items", "Bin")
+DRAFTS_CANDIDATES = ("Drafts", "Draft")
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +125,15 @@ def append_to_sent(client: IMAPClient, raw_message: bytes) -> str | None:
             logger.debug("Append to %s failed: %s", name, e)
     logger.warning("Could not save message copy to any Sent folder")
     return None
+
+
+def append_to_drafts(client: IMAPClient, raw_message: bytes) -> str:
+    """Store a message in the Drafts folder with the \\Draft flag. Returns the folder used."""
+    folder = find_special_folder(client, b"\\Drafts", config.DRAFTS_FOLDER, DRAFTS_CANDIDATES)
+    if not folder:
+        raise ValueError("Could not find the Drafts folder (see email_list_folders); set DRAFTS_FOLDER")
+    client.append(folder, raw_message, flags=["\\Draft", "\\Seen"])
+    return folder
 
 
 def move_messages(client: IMAPClient, uids: list[int], to_folder: str) -> None:
@@ -445,7 +457,67 @@ def build_email_message(body: str, html: bool, attachment_parts: list[MIMEBase])
     return msg
 
 
+_TAG_RE = re.compile(r"<\s*/?\s*[a-zA-Z][a-zA-Z0-9-]*(\s[^<>]*)?/?\s*>")
+_ADDRESS_RE = re.compile(r"^[^@\s<>,;\"']+@[^@\s<>,;\"']+\.[^@\s<>,;\"']+$")
+
+
+def validate_header_text(value: str | None, name: str) -> str:
+    """Reject CR/LF (header injection) in a free-text header such as Subject."""
+    if value is None:
+        return ""
+    if "\r" in value or "\n" in value:
+        raise ValueError(f"{name} must not contain line breaks")
+    return value
+
+
+def parse_recipients(value: str | None, name: str = "recipient") -> list[str]:
+    """Parse a comma/semicolon separated recipient list into validated ``Name <addr>`` strings.
+
+    Raises ValueError on header injection attempts or malformed addresses.
+    """
+    if not value:
+        return []
+    validate_header_text(value, name)
+    result = []
+    for display, addr in getaddresses([value.replace(";", ",")]):
+        addr = addr.strip()
+        if not addr:
+            continue
+        if not _ADDRESS_RE.match(addr):
+            raise ValueError(f"Invalid email address in {name}: {addr!r}")
+        display = display.strip()
+        result.append(formataddr((display, addr)) if display else addr)
+    if not result:
+        raise ValueError(f"No valid email address found in {name}: {value!r}")
+    return result
+
+
+def bare_addresses(recipients: list[str]) -> list[str]:
+    """SMTP envelope addresses for a list produced by parse_recipients."""
+    return [parseaddr(r)[1] for r in recipients]
+
+
 def split_addresses(value: str | None) -> list[str]:
     if not value:
         return []
     return [addr.strip() for addr in value.replace(";", ",").split(",") if addr.strip()]
+
+
+def clean_rich_text(value: Any) -> str:
+    """Normalise rich text stored in iCloud fields (event notes/location, contact notes).
+
+    iCloud passes through HTML that users paste into Calendar/Contacts. With
+    ICLOUD_HTML_MODE=text (default) such values are rendered to readable text;
+    with "raw" they are returned untouched.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    if config.HTML_MODE == "raw" or not _TAG_RE.search(text):
+        return text
+    try:
+        from inscriptis import get_text
+
+        return get_text(text).strip()
+    except Exception:
+        return text
