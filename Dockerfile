@@ -2,33 +2,26 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy project files
-COPY pyproject.toml ./
+COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 
-# Install package
 RUN pip install --no-cache-dir .
 
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash app \
-    && chown -R app:app /app
-
+RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
 USER app
 
-# Cloud Run uses PORT env variable (default 8080, but we prefer 8000)
-ENV PORT=8000
+# Cloud Run injects PORT; default to 8000 for local docker runs.
+ENV PORT=8000 \
+    MCP_TRANSPORT=http \
+    ICLOUD_MCP_LOCAL_FILES=false \
+    PYTHONUNBUFFERED=1
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:${PORT}/health || exit 1
 
-# Run in HTTP/Streamable mode by default (for Cloud Run)
-# Use 0.0.0.0 to listen on all interfaces (required for Cloud Run)
-CMD sh -c "python -c \"from icloud_mcp.server import mcp; mcp.run(transport='http', host='0.0.0.0', port=int('${PORT}'))\""
+# Stateless Streamable HTTP on 0.0.0.0:$PORT/mcp
+CMD ["icloud-mcp", "--http"]
