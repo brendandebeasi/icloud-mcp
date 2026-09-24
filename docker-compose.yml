@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   icloud-mcp:
     build: .
@@ -7,15 +5,11 @@ services:
     ports:
       - "${MCP_SERVER_PORT:-8000}:8000"
     environment:
-      # iCloud credentials (optional, can use headers instead)
-      - ICLOUD_EMAIL=${ICLOUD_EMAIL:-}
-      - ICLOUD_APP_SPECIFIC_PASSWORD=${ICLOUD_APP_SPECIFIC_PASSWORD:-}
-
-      # Server configuration (optional, defaults provided)
-      - CALDAV_SERVER=${CALDAV_SERVER:-https://caldav.icloud.com}
-      - CARDDAV_SERVER=${CARDDAV_SERVER:-https://contacts.icloud.com}
-      - IMAP_SERVER=${IMAP_SERVER:-imap.mail.me.com}
-      - SMTP_SERVER=${SMTP_SERVER:-smtp.mail.me.com}
-      - PORT=8000
-
+      # Optional fallback credentials; clients can send them per request instead
+      # (X-Apple-Email / X-Apple-App-Specific-Password headers or HTTP Basic auth).
+      ICLOUD_EMAIL: ${ICLOUD_EMAIL:-}
+      ICLOUD_APP_SPECIFIC_PASSWORD: ${ICLOUD_APP_SPECIFIC_PASSWORD:-}
+      DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PORT: 8000
     restart: unless-stopped

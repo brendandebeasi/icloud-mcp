@@ -42,3 +42,6 @@ htmlcov/
 
 # Logs
 *.log
+.venv/
+.ruff_cache/
+uv.lock

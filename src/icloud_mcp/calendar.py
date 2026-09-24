@@ -1,24 +1,255 @@
-"""CalDAV tools for calendar management."""
+"""CalDAV operations for iCloud calendars.
 
-import caldav
+Ported from the battle-tested Resonar agent tools: VEVENT-capability based
+calendar filtering (Reminders lists are VTODO-only and cannot hold events),
+client-side expansion of recurring series, per-event DAV clients bound to the
+event's own host (iCloud shards calendars across ``pNN-caldav.icloud.com``),
+RRULE support, IANA timezone handling and iTIP invitations over SMTP.
+"""
+
+import logging
 import smtplib
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse
+from datetime import UTC, date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from fastmcp import Context
+from email.utils import formatdate
+from typing import Any
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import caldav
+from dateutil import tz as dateutil_tz
+from dateutil.rrule import rrulestr
+
 from .auth import require_auth
 from .config import config
 
+logger = logging.getLogger(__name__)
+
+REMINDERS_NOTE = (
+    "iCloud does not allow creating events in Reminders lists. "
+    "They are VTODO-only system calendars and can only be read. "
+    "Use another calendar to create events."
+)
+
+
+# ---------------------------------------------------------------------------
+# Clients
+# ---------------------------------------------------------------------------
+
 
 def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
-    """Create CalDAV client (stateless)."""
+    return caldav.DAVClient(url=config.CALDAV_SERVER, username=email, password=password)
+
+
+def _client_for_url(url: str, email: str, password: str) -> caldav.DAVClient:
+    """DAV client bound to the host of ``url``.
+
+    iCloud returns calendar/event URLs on per-user shards
+    (``https://p72-caldav.icloud.com/...``). Using the generic
+    ``caldav.icloud.com`` client for those URLs breaks URL joining.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(
+            f"Expected a full calendar/event URL from calendar_list_calendars "
+            f"or calendar_list_events, got: {url!r}"
+        )
     return caldav.DAVClient(
-        url=config.CALDAV_SERVER,
-        username=email,
-        password=password
+        url=f"{parsed.scheme}://{parsed.netloc}", username=email, password=password
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers: recurrence, dates, timezones, iCalendar text
+# ---------------------------------------------------------------------------
+
+
+def normalize_rrule(rrule: str, dtstart: datetime | None = None) -> str:
+    """Validate an RFC 5545 recurrence rule and return it as an ``RRULE:`` line.
+
+    Accepts ``FREQ=...`` or ``RRULE:FREQ=...``. The event's own start acts as
+    DTSTART, so a DTSTART inside the rule is rejected.
+    """
+    rule = rrule.strip()
+    if rule.upper().startswith("RRULE:"):
+        rule = rule[len("RRULE:"):]
+    if "DTSTART" in rule.upper():
+        raise ValueError(
+            "Do not include DTSTART in rrule; the event start time is the series start."
+        )
+    try:
+        rrulestr(rule, dtstart=dtstart or datetime(2000, 1, 1))
+    except Exception as e:
+        raise ValueError(f"Invalid RRULE '{rrule}': {e}") from e
+    return f"RRULE:{rule}"
+
+
+def _zone(tz_name: str | None) -> ZoneInfo:
+    name = tz_name or config.DEFAULT_TIMEZONE
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise ValueError(
+            f"Unknown timezone {name!r}; use an IANA name such as 'Europe/Berlin' or 'UTC'."
+        ) from e
+
+
+def _parse_when(value: str, tz_name: str | None) -> date | datetime:
+    """Parse ``YYYY-MM-DD`` (all-day date) or ISO datetime.
+
+    Naive datetimes are interpreted in ``tz_name`` (default: DEFAULT_TIMEZONE).
+    Datetimes with an explicit offset are kept as-is.
+    """
+    text = value.strip()
+    if len(text) == 10:
+        return date.fromisoformat(text)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_zone(tz_name))
+    return dt
+
+
+def _parse_range_bound(value: str | None, default: datetime, end_of_day: bool) -> datetime:
+    if not value:
+        return default
+    parsed = _parse_when(value, None)
+    if isinstance(parsed, datetime):
+        return parsed
+    dt = datetime.combine(parsed, datetime.min.time())
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return dt.replace(tzinfo=_zone(None))
+
+
+def _escape_text(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def _dt_property(name: str, value: date | datetime) -> tuple[str, str | None]:
+    """Return an iCalendar DTSTART/DTEND line and the TZID it references (if any)."""
+    if isinstance(value, datetime):
+        tzinfo = value.tzinfo
+        key = getattr(tzinfo, "key", None)
+        if tzinfo is None:
+            return f"{name}:{value.strftime('%Y%m%dT%H%M%SZ')}", None
+        if key == "UTC" or value.utcoffset() == timedelta(0):
+            return f"{name}:{value.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}", None
+        if key:
+            return f"{name};TZID={key}:{value.strftime('%Y%m%dT%H%M%S')}", key
+        # Fixed offset without an IANA name: store as UTC.
+        return f"{name}:{value.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}", None
+    return f"{name};VALUE=DATE:{value.strftime('%Y%m%d')}", None
+
+
+def _vtimezone_block(tzid: str, first: date, last: date) -> str:
+    """VTIMEZONE component for ``tzid`` covering ``[first, last]`` (best effort)."""
+    try:
+        import icalendar
+
+        component = icalendar.Timezone.from_tzinfo(
+            ZoneInfo(tzid), first_date=first, last_date=last
+        )
+        return component.to_ical().decode("utf-8").replace("\r\n", "\n").strip()
+    except Exception as e:  # pragma: no cover - depends on icalendar internals
+        logger.debug("Could not build VTIMEZONE for %s: %s", tzid, e)
+        return ""
+
+
+def _value_to_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _prop_tzid(prop: Any) -> str:
+    params = getattr(prop, "params", {}) or {}
+    for key in ("TZID", "X-VOBJ-ORIGINAL-TZID"):
+        values = params.get(key)
+        if values:
+            return values[0]
+    value = getattr(prop, "value", None)
+    key = getattr(getattr(value, "tzinfo", None), "key", None)
+    return key or ""
+
+
+def _attendee_emails(vevent: Any) -> list[str]:
+    result = []
+    if hasattr(vevent, "attendee_list"):
+        for att in vevent.attendee_list:
+            value = str(getattr(att, "value", "") or "")
+            if value.lower().startswith("mailto:"):
+                value = value[7:]
+            if value:
+                result.append(value)
+    return result
+
+
+def _vevent_to_dict(vevent: Any, url: str, calendar_name: str) -> dict[str, Any]:
+    def text(attr: str) -> str:
+        prop = getattr(vevent, attr, None)
+        return str(prop.value) if prop is not None and prop.value is not None else ""
+
+    start_prop = getattr(vevent, "dtstart", None)
+    end_prop = getattr(vevent, "dtend", None)
+    start_value = start_prop.value if start_prop is not None else None
+    all_day = isinstance(start_value, date) and not isinstance(start_value, datetime)
+
+    rrule = text("rrule")
+    return {
+        "id": url,
+        "url": url,
+        "summary": text("summary"),
+        "description": text("description"),
+        "location": text("location"),
+        "start": _value_to_iso(start_value),
+        "end": _value_to_iso(end_prop.value) if end_prop is not None else None,
+        "all_day": all_day,
+        "start_timezone": _prop_tzid(start_prop) if start_prop is not None else "",
+        "end_timezone": _prop_tzid(end_prop) if end_prop is not None else "",
+        "recurring": bool(rrule) or hasattr(vevent, "recurrence_id"),
+        "rrule": rrule,
+        "attendees": _attendee_emails(vevent),
+        "calendar": calendar_name,
+    }
+
+
+def _supports_events(cal: caldav.Calendar) -> bool | None:
+    """True/False when the server tells us, None when unknown."""
+    try:
+        components = cal.get_supported_components()
+    except Exception:
+        return None
+    if not components:
+        return None
+    return "VEVENT" in components
+
+
+def _event_calendars(principal: caldav.Principal) -> list[caldav.Calendar]:
+    calendars = principal.calendars()
+    usable = []
+    for cal in calendars:
+        if cal.name and "⚠" in cal.name:
+            continue
+        if _supports_events(cal) is False:
+            continue
+        usable.append(cal)
+    return usable or list(calendars)
+
+
+# ---------------------------------------------------------------------------
+# iTIP invitations
+# ---------------------------------------------------------------------------
 
 
 def _send_calendar_invitation(
@@ -29,616 +260,502 @@ def _send_calendar_invitation(
     summary: str,
     start: str,
     end: str,
-    location: Optional[str] = None,
-    method: str = "REQUEST"
+    location: str | None = None,
+    method: str = "REQUEST",
 ) -> None:
-    """
-    Send calendar invitation via email (iTIP protocol).
+    """Email an iTIP REQUEST/CANCEL for the event to one attendee."""
+    from .mail import _append_to_sent, _close_imap_client, _get_imap_client
 
-    Args:
-        organizer_email: Organizer's email address
-        organizer_password: Organizer's password
-        attendee_email: Attendee's email address
-        ical_data: iCalendar data (VCALENDAR format)
-        summary: Event summary
-        start: Start datetime string
-        end: End datetime string
-        location: Event location (optional)
-        method: iTIP method (REQUEST, CANCEL, etc.)
-    """
-    # Create multipart message
-    msg = MIMEMultipart('alternative')
-    msg['From'] = organizer_email
-    msg['To'] = attendee_email
-    msg['Subject'] = f"Invitation: {summary}"
+    msg = MIMEMultipart("alternative")
+    msg["From"] = organizer_email
+    msg["To"] = attendee_email
+    msg["Subject"] = (
+        f"Cancelled: {summary}" if method == "CANCEL" else f"Invitation: {summary}"
+    )
+    msg["Date"] = formatdate(localtime=True)
 
-    # Add Date header
-    from email.utils import formatdate
-    msg['Date'] = formatdate(localtime=True)
-
-    # Create plain text part
-    text_body = f"""You have been invited to the following event:
-
-Summary: {summary}
-Start: {start}
-End: {end}"""
-
+    text_body = (
+        f"{'The following event has been cancelled' if method == 'CANCEL' else 'You have been invited to the following event'}:\n\n"
+        f"Summary: {summary}\nStart: {start}\nEnd: {end}"
+    )
     if location:
         text_body += f"\nLocation: {location}"
-
     text_body += f"\n\nOrganizer: {organizer_email}"
+    msg.attach(MIMEText(text_body, "plain"))
 
-    msg.attach(MIMEText(text_body, 'plain'))
-
-    # Modify iCalendar data to include METHOD
-    # Replace the first line with VCALENDAR and METHOD
-    ical_lines = ical_data.strip().split('\n')
-    if ical_lines[0] == 'BEGIN:VCALENDAR':
-        # Insert METHOD after BEGIN:VCALENDAR
-        ical_lines.insert(1, f'METHOD:{method}')
-        ical_with_method = '\n'.join(ical_lines)
-    else:
-        ical_with_method = ical_data
-
-    # Add organizer to the VEVENT if not present
-    if 'ORGANIZER' not in ical_with_method:
-        # Insert ORGANIZER after UID
-        ical_lines = ical_with_method.split('\n')
-        for i, line in enumerate(ical_lines):
-            if line.startswith('UID:'):
-                ical_lines.insert(i + 1, f'ORGANIZER;CN={organizer_email}:mailto:{organizer_email}')
+    lines = ical_data.strip().replace("\r\n", "\n").split("\n")
+    if lines and lines[0] == "BEGIN:VCALENDAR" and not any(
+        line.startswith("METHOD:") for line in lines
+    ):
+        lines.insert(1, f"METHOD:{method}")
+    if not any(line.startswith("ORGANIZER") for line in lines):
+        for i, line in enumerate(lines):
+            if line.startswith("UID:"):
+                lines.insert(
+                    i + 1, f"ORGANIZER;CN={organizer_email}:mailto:{organizer_email}"
+                )
                 break
-        ical_with_method = '\n'.join(ical_lines)
+    if method == "CANCEL" and not any(line.startswith("STATUS:CANCELLED") for line in lines):
+        lines = [line for line in lines if not line.startswith("STATUS:")]
+        for i, line in enumerate(lines):
+            if line.startswith("UID:"):
+                lines.insert(i + 1, "STATUS:CANCELLED")
+                break
+    ical_with_method = "\n".join(lines)
 
-    # Create calendar part with proper content type
-    cal_part = MIMEText(ical_with_method, 'calendar', 'utf-8')
-    cal_part.add_header('Content-Class', 'urn:content-classes:calendarmessage')
-    cal_part.add_header('Content-Type', f'text/calendar; method={method}; charset=UTF-8')
+    cal_part = MIMEText(ical_with_method, "calendar", "utf-8")
+    cal_part.add_header("Content-Class", "urn:content-classes:calendarmessage")
+    cal_part.replace_header(
+        "Content-Type", f"text/calendar; method={method}; charset=UTF-8"
+    )
     msg.attach(cal_part)
 
-    # Send via SMTP
-    smtp_client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT)
+    smtp_client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT, timeout=30)
     try:
         smtp_client.starttls()
         smtp_client.login(organizer_email, organizer_password)
         smtp_client.send_message(msg, from_addr=organizer_email, to_addrs=[attendee_email])
     finally:
-        smtp_client.quit()
+        try:
+            smtp_client.quit()
+        except Exception:
+            pass
 
-    # Save copy to Sent folder via IMAP (same as regular emails)
     try:
-        from .email import _get_imap_client, _close_imap_client
-
         imap_client = _get_imap_client(organizer_email, organizer_password)
         try:
-            # Convert message to bytes
-            msg_bytes = msg.as_bytes()
-
-            # Try to append to Sent folder
-            try:
-                imap_client.append(config.SENT_FOLDER, msg_bytes, flags=['\\Seen'])
-            except Exception:
-                # Try common alternatives
-                for folder_name in ['Sent', 'Sent Items', config.SENT_FOLDER]:
-                    try:
-                        imap_client.append(folder_name, msg_bytes, flags=['\\Seen'])
-                        break
-                    except Exception:
-                        continue
+            _append_to_sent(imap_client, msg.as_bytes())
         finally:
             _close_imap_client(imap_client)
-    except Exception:
-        # Silently ignore errors saving to Sent folder
-        pass
+    except Exception as e:
+        logger.warning("Could not save invitation copy to Sent: %s", e)
 
 
-async def list_calendars(context: Context) -> List[Dict[str, Any]]:
-    """
-    List all available calendars.
-
-    Returns:
-        List of calendars with id, name, and description
-    """
-    email, password = require_auth(context)
-    client = _get_caldav_client(email, password)
-    principal = client.principal()
-    calendars = principal.calendars()
-
-    result = []
-    for cal in calendars:
-        result.append({
-            "id": str(cal.url),
-            "name": cal.name or "Unnamed Calendar",
-            "url": str(cal.url)
-        })
-
-    return result
-
-
-async def list_events(
-    context: Context,
-    calendar_id: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """
-    List calendar events with optional filtering.
-
-    Args:
-        calendar_id: Specific calendar URL/ID (optional, defaults to all non-reminder calendars)
-        start_date: Start date filter in ISO format (YYYY-MM-DD)
-        end_date: End date filter in ISO format (YYYY-MM-DD)
-
-    Returns:
-        List of events with details
-    """
-    email, password = require_auth(context)
-    client = _get_caldav_client(email, password)
-    principal = client.principal()
-
-    # Parse dates
-    if start_date:
-        start = datetime.fromisoformat(start_date)
-        # If only date provided (no time), set to start of day
-        if len(start_date) == 10:  # Format: YYYY-MM-DD
-            start = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    else:
-        start = datetime.now() - timedelta(days=90)
-
-    if end_date:
-        end = datetime.fromisoformat(end_date)
-        # If only date provided (no time), set to end of day
-        if len(end_date) == 10:  # Format: YYYY-MM-DD
-            # Add one day to include the entire end date
-            end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
-    else:
-        end = datetime.now() + timedelta(days=365)
-
-    result = []
-
-    # Get calendars
-    if calendar_id:
-        calendars_to_search = [caldav.Calendar(client=client, url=calendar_id)]
-    else:
-        all_calendars = principal.calendars()
-        if not all_calendars:
-            return []
-
-        # Filter out reminder calendars (they don't have events in the same format)
-        calendars_to_search = [
-            cal for cal in all_calendars
-            if cal.name and '⚠' not in cal.name and 'reminder' not in cal.name.lower()
-        ]
-
-        # If all calendars are filtered out, search all
-        if not calendars_to_search:
-            calendars_to_search = all_calendars
-
-    # Search events in all relevant calendars
-    for calendar in calendars_to_search:
-        try:
-            # Fetch events using date_search
-            events = calendar.date_search(start=start, end=end, expand=True)
-
-            for event in events:
-                try:
-                    event.load()  # Ensure event data is loaded
-                    vevent = event.vobject_instance.vevent
-
-                    # Parse start/end dates safely
-                    start_value = None
-                    end_value = None
-
-                    if hasattr(vevent, 'dtstart') and vevent.dtstart:
-                        try:
-                            start_value = vevent.dtstart.value
-                            if hasattr(start_value, 'isoformat'):
-                                start_value = start_value.isoformat()
-                            else:
-                                start_value = str(start_value)
-                        except Exception as _e:
-                            pass
-
-                    if hasattr(vevent, 'dtend') and vevent.dtend:
-                        try:
-                            end_value = vevent.dtend.value
-                            if hasattr(end_value, 'isoformat'):
-                                end_value = end_value.isoformat()
-                            else:
-                                end_value = str(end_value)
-                        except Exception as _e:
-                            pass
-
-                    result.append({
-                        "id": str(event.url),
-                        "summary": str(vevent.summary.value) if hasattr(vevent, 'summary') and vevent.summary else "",
-                        "description": str(vevent.description.value) if hasattr(vevent, 'description') and vevent.description else "",
-                        "start": start_value,
-                        "end": end_value,
-                        "location": str(vevent.location.value) if hasattr(vevent, 'location') and vevent.location else "",
-                        "calendar": calendar.name or "Unknown",
-                        "url": str(event.url)
-                    })
-                except Exception as _e:
-                    # Skip malformed events
-                    continue
-        except Exception as _e:
-            # Skip calendars that fail to search
-            continue
-
-    return result
-
-
-async def create_event(
-    context: Context,
+def _notify_attendees(
+    email: str,
+    password: str,
+    attendees: list[str],
+    ical_data: str,
     summary: str,
     start: str,
     end: str,
-    description: Optional[str] = None,
-    location: Optional[str] = None,
-    attendees: Optional[List[str]] = None,
-    calendar_id: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Create a new calendar event.
+    location: str | None,
+    method: str,
+) -> list[str]:
+    """Send iTIP mail to each attendee; returns the list of failures."""
+    failed = []
+    for attendee_email in attendees:
+        if attendee_email.lower() == email.lower():
+            continue
+        try:
+            _send_calendar_invitation(
+                email, password, attendee_email, ical_data, summary, start, end, location, method
+            )
+        except Exception as e:
+            logger.error("Failed to send %s to %s: %s", method, attendee_email, e)
+            failed.append(attendee_email)
+    return failed
 
-    Args:
-        summary: Event title
-        start: Start datetime in ISO format
-        end: End datetime in ISO format
-        description: Event description (optional)
-        location: Event location (optional)
-        attendees: List of attendee email addresses to invite (optional)
-        calendar_id: Target calendar URL/ID (optional, defaults to first non-reminder calendar)
 
-    Returns:
-        Created event details
-    """
-    email, password = require_auth(context)
+# ---------------------------------------------------------------------------
+# Operations
+# ---------------------------------------------------------------------------
+
+
+def list_calendars() -> list[dict[str, Any]]:
+    email, password = require_auth()
+    principal = _get_caldav_client(email, password).principal()
+
+    result = []
+    for cal in principal.calendars():
+        supports_events = _supports_events(cal)
+        item: dict[str, Any] = {
+            "id": str(cal.url),
+            "name": cal.name or "Unnamed Calendar",
+            "url": str(cal.url),
+        }
+        if supports_events is False:
+            item["read_only"] = True
+            item["note"] = REMINDERS_NOTE
+        result.append(item)
+    return result
+
+
+def list_events(
+    calendar_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    email, password = require_auth()
     client = _get_caldav_client(email, password)
-    principal = client.principal()
 
-    # Get calendar
+    now = datetime.now(UTC)
+    start = _parse_range_bound(start_date, now - timedelta(days=90), end_of_day=False)
+    end = _parse_range_bound(end_date, now + timedelta(days=365), end_of_day=True)
+    if end <= start:
+        raise ValueError("end_date must be after start_date")
+
     if calendar_id:
-        calendar = caldav.Calendar(client=client, url=calendar_id)
+        cal_client = _client_for_url(calendar_id, email, password)
+        calendars = [caldav.Calendar(client=cal_client, url=calendar_id)]
     else:
-        all_calendars = principal.calendars()
-        if not all_calendars:
-            raise ValueError("No calendars found")
+        calendars = _event_calendars(client.principal())
 
-        # Filter out reminder/task calendars - they don't support VEVENT
-        event_calendars = [
-            cal for cal in all_calendars
-            if cal.name and '⚠' not in cal.name and 'reminder' not in cal.name.lower()
-        ]
+    result: list[dict[str, Any]] = []
+    for calendar in calendars:
+        try:
+            # expand=True + split_expanded (default) returns every occurrence of
+            # a recurring series as its own object with the occurrence's own
+            # DTSTART/DTEND. Do NOT call event.load() on those: it re-fetches the
+            # series master and overwrites the expanded occurrence.
+            events = calendar.search(start=start, end=end, event=True, expand=True)
+        except Exception as e:
+            logger.warning("Search failed for calendar %s: %s", calendar.url, e)
+            continue
 
-        if not event_calendars:
-            raise ValueError("No event calendars found (only reminder/task calendars available)")
+        try:
+            calendar_name = calendar.name or "Unknown"
+        except Exception:
+            calendar_name = "Unknown"
 
-        calendar = event_calendars[0]
+        for event in events:
+            try:
+                if not event.data:
+                    event.load()
+                vevent = event.vobject_instance.vevent
+                result.append(_vevent_to_dict(vevent, str(event.url), calendar_name))
+            except Exception as e:
+                logger.debug("Skipping malformed event %s: %s", getattr(event, "url", "?"), e)
+                continue
 
-    # Build iCalendar data with proper formatting for iCloud
-    start_dt = datetime.fromisoformat(start)
-    end_dt = datetime.fromisoformat(end)
-    now = datetime.now()
+    result.sort(key=lambda item: item.get("start") or "")
+    return result
 
-    # Generate UID without dots (iCloud compatible)
+
+def search_events(
+    query: str,
+    calendar_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    events = list_events(calendar_id, start_date, end_date)
+    needle = query.lower()
+    return [
+        event
+        for event in events
+        if needle in event.get("summary", "").lower()
+        or needle in event.get("description", "").lower()
+        or needle in event.get("location", "").lower()
+    ]
+
+
+def _resolve_calendar(
+    client: caldav.DAVClient, calendar_id: str | None, email: str, password: str
+) -> caldav.Calendar:
+    if calendar_id:
+        cal_client = _client_for_url(calendar_id, email, password)
+        calendar = caldav.Calendar(client=cal_client, url=calendar_id)
+        if _supports_events(calendar) is False:
+            raise ValueError(f"Cannot create events in calendar '{calendar_id}': {REMINDERS_NOTE}")
+        return calendar
+
+    candidates = _event_calendars(client.principal())
+    if not candidates:
+        raise ValueError("No calendars found for this account")
+    return candidates[0]
+
+
+def create_event(
+    summary: str,
+    start: str,
+    end: str,
+    description: str | None = None,
+    location: str | None = None,
+    attendees: list[str] | None = None,
+    calendar_id: str | None = None,
+    timezone: str | None = None,
+    rrule: str | None = None,
+) -> dict[str, Any]:
+    email, password = require_auth()
+    client = _get_caldav_client(email, password)
+    calendar = _resolve_calendar(client, calendar_id, email, password)
+
+    start_value = _parse_when(start, timezone)
+    end_value = _parse_when(end, timezone)
+    if isinstance(start_value, datetime) != isinstance(end_value, datetime):
+        raise ValueError("start and end must both be dates (all-day) or both be datetimes")
+    all_day = not isinstance(start_value, datetime)
+    if all_day and end_value <= start_value:
+        # DTEND for all-day events is exclusive; a one-day event ends the next day.
+        end_value = start_value + timedelta(days=1)
+    if not all_day and end_value <= start_value:
+        raise ValueError("end must be after start")
+
+    now = datetime.now(UTC)
     uid = f"{int(now.timestamp())}{now.microsecond}@icloud-mcp"
+    dtstart_line, tzid = _dt_property("DTSTART", start_value)
+    dtend_line, _ = _dt_property("DTEND", end_value)
 
-    # Build proper iCalendar format (iCloud is very strict about formatting)
-    ical_data = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//iCloud MCP//EN
-CALSCALE:GREGORIAN
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{now.strftime('%Y%m%dT%H%M%SZ')}
-DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}
-DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}
-SUMMARY:{summary}
-STATUS:CONFIRMED
-SEQUENCE:0
-"""
+    rrule_line = ""
+    if rrule and rrule.strip():
+        rrule_line = normalize_rrule(
+            rrule, start_value if isinstance(start_value, datetime) else None
+        )
 
+    vtimezone = ""
+    if tzid:
+        first = start_value.date() - timedelta(days=366)
+        last = start_value.date() + timedelta(days=366 * (5 if rrule_line else 1))
+        vtimezone = _vtimezone_block(tzid, first, last)
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//iCloud MCP//EN",
+        "CALSCALE:GREGORIAN",
+    ]
+    if vtimezone:
+        lines.append(vtimezone)
+    lines += [
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{now.strftime('%Y%m%dT%H%M%SZ')}",
+        dtstart_line,
+        dtend_line,
+        f"SUMMARY:{_escape_text(summary)}",
+        "STATUS:CONFIRMED",
+        "SEQUENCE:0",
+    ]
+    if rrule_line:
+        lines.append(rrule_line)
     if description:
-        # Escape special characters in description
-        desc_escaped = description.replace('\\', '\\\\').replace(',', '\\,').replace(';', '\\;').replace('\n', '\\n')
-        ical_data += f"DESCRIPTION:{desc_escaped}\n"
+        lines.append(f"DESCRIPTION:{_escape_text(description)}")
     if location:
-        loc_escaped = location.replace('\\', '\\\\').replace(',', '\\,').replace(';', '\\;')
-        ical_data += f"LOCATION:{loc_escaped}\n"
-
-    # Add attendees (meeting invitations)
+        lines.append(f"LOCATION:{_escape_text(location)}")
     if attendees:
+        lines.append(f"ORGANIZER;CN={email}:mailto:{email}")
         for attendee_email in attendees:
-            # Format: ATTENDEE;CN=email;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:email
-            ical_data += f"ATTENDEE;CN={attendee_email};CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee_email}\n"
+            lines.append(
+                f"ATTENDEE;CN={attendee_email};CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;"
+                f"PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee_email}"
+            )
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+    ical_data = "\n".join(lines)
 
-    ical_data += "END:VEVENT\nEND:VCALENDAR"
-
-    # Create event using add_event (more reliable than save_event for iCloud)
     try:
         event = calendar.add_event(ical_data)
     except Exception as e:
-        # If add_event fails, try save_event as fallback
-        raise ValueError(f"Failed to create event in calendar '{calendar.name}': {str(e)}")
+        raise ValueError(f"Failed to create event in calendar '{calendar.name}': {e}") from e
 
-    # Send email invitations to attendees (iTIP protocol)
+    failed = []
     if attendees:
-        for attendee_email in attendees:
-            try:
-                _send_calendar_invitation(
-                    organizer_email=email,
-                    organizer_password=password,
-                    attendee_email=attendee_email,
-                    ical_data=ical_data,
-                    summary=summary,
-                    start=start,
-                    end=end,
-                    location=location,
-                    method="REQUEST"
-                )
-            except Exception as e:
-                # Log error but don't fail the event creation
-                # The event is already created, we just failed to send the invitation
-                import logging
-                logging.error(f"Failed to send invitation to {attendee_email}: {e}")
+        failed = _notify_attendees(
+            email, password, attendees, ical_data, summary, start, end, location, "REQUEST"
+        )
 
-    return {
+    result = {
         "id": str(event.url),
+        "url": str(event.url),
         "summary": summary,
-        "start": start,
-        "end": end,
+        "start": _value_to_iso(start_value),
+        "end": _value_to_iso(end_value),
+        "all_day": all_day,
+        "timezone": tzid or ("UTC" if not all_day else ""),
         "description": description or "",
         "location": location or "",
         "attendees": attendees or [],
+        "rrule": rrule_line[len("RRULE:"):] if rrule_line else "",
         "calendar": calendar.name,
-        "url": str(event.url)
     }
+    if failed:
+        result["invitations_failed"] = failed
+    return result
 
 
-async def update_event(
-    context: Context,
-    event_id: str,
-    summary: Optional[str] = None,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    description: Optional[str] = None,
-    location: Optional[str] = None,
-    attendees: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    """
-    Update an existing calendar event.
-
-    Args:
-        event_id: Event URL/ID
-        summary: New event title (optional)
-        start: New start datetime in ISO format (optional)
-        end: New end datetime in ISO format (optional)
-        description: New description (optional)
-        location: New location (optional)
-        attendees: New list of attendee email addresses (optional, replaces existing)
-
-    Returns:
-        Updated event details
-    """
-    email, password = require_auth(context)
-
-    # Create a client with the correct base URL for this specific event
-    # This prevents URL joining errors when event is on a different server (e.g., p72-caldav.icloud.com)
-    parsed = urlparse(event_id)
-    event_base_url = f"{parsed.scheme}://{parsed.netloc}"
-    event_client = caldav.DAVClient(url=event_base_url, username=email, password=password)
-
+def _load_event(event_id: str, email: str, password: str):
+    client = _client_for_url(event_id, email, password)
+    event = caldav.CalendarObjectResource(client=client, url=event_id)
     try:
-        # Load existing event using CalendarObjectResource
-        event = caldav.CalendarObjectResource(client=event_client, url=event_id)
         event.load()
     except Exception as e:
-        raise Exception(f"Error loading event: {str(e)}")
+        raise ValueError(f"Could not load event {event_id}: {e}") from e
+    return client, event
 
+
+def _set_datetime(prop: Any, new_value: date | datetime, timezone: str | None) -> None:
+    """Assign a new DTSTART/DTEND value, preserving or replacing its timezone."""
+    prop.params.pop("X-VOBJ-ORIGINAL-TZID", None)
+    prop.params.pop("TZID", None)
+    prop.params.pop("VALUE", None)
+
+    if not isinstance(new_value, datetime):
+        prop.value = new_value
+        return
+
+    if new_value.tzinfo is not None and timezone is None:
+        # Explicit offset in the input string (e.g. ...+02:00): store as UTC.
+        prop.value = new_value.astimezone(UTC).replace(tzinfo=dateutil_tz.UTC)
+        return
+
+    tz_name = timezone
+    if tz_name is None:
+        old = getattr(prop, "value", None)
+        if isinstance(old, datetime) and old.tzinfo is not None:
+            # Keep the event's existing zone.
+            prop.value = new_value.replace(tzinfo=old.tzinfo)
+            return
+        tz_name = config.DEFAULT_TIMEZONE
+
+    _zone(tz_name)  # validate
+    if tz_name == "UTC":
+        prop.value = new_value.replace(tzinfo=dateutil_tz.UTC)
+    else:
+        prop.value = new_value.replace(tzinfo=None)
+        prop.params["TZID"] = [tz_name]
+
+
+def update_event(
+    event_id: str,
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    attendees: list[str] | None = None,
+    timezone: str | None = None,
+    rrule: str | None = None,
+) -> dict[str, Any]:
+    email, password = require_auth()
+    client, event = _load_event(event_id, email, password)
     vevent = event.vobject_instance.vevent
 
-    # Update fields
-    if summary:
-        vevent.summary.value = summary
+    if summary is not None:
+        if hasattr(vevent, "summary"):
+            vevent.summary.value = summary
+        else:
+            vevent.add("summary").value = summary
     if start:
-        vevent.dtstart.value = datetime.fromisoformat(start)
+        value = _parse_when(start, timezone)
+        target = vevent.dtstart if hasattr(vevent, "dtstart") else vevent.add("dtstart")
+        _set_datetime(target, value, timezone)
     if end:
-        vevent.dtend.value = datetime.fromisoformat(end)
+        value = _parse_when(end, timezone)
+        if hasattr(vevent, "duration"):
+            vevent.remove(vevent.duration)
+        target = vevent.dtend if hasattr(vevent, "dtend") else vevent.add("dtend")
+        _set_datetime(target, value, timezone)
+    if timezone and not start and not end:
+        for attr in ("dtstart", "dtend"):
+            prop = getattr(vevent, attr, None)
+            if prop is not None and isinstance(prop.value, datetime):
+                _set_datetime(prop, prop.value.replace(tzinfo=None), timezone)
+
+    if rrule is not None:
+        if rrule.strip() == "":
+            if hasattr(vevent, "rrule"):
+                vevent.remove(vevent.rrule)
+        else:
+            rrule_value = normalize_rrule(rrule)[len("RRULE:"):]
+            if hasattr(vevent, "rrule"):
+                vevent.rrule.value = rrule_value
+            else:
+                vevent.add("rrule").value = rrule_value
+
     if description is not None:
-        if hasattr(vevent, 'description'):
+        if hasattr(vevent, "description"):
             vevent.description.value = description
         else:
-            vevent.add('description').value = description
+            vevent.add("description").value = description
     if location is not None:
-        if hasattr(vevent, 'location'):
+        if hasattr(vevent, "location"):
             vevent.location.value = location
         else:
-            vevent.add('location').value = location
+            vevent.add("location").value = location
 
-    # Update attendees
     if attendees is not None:
-        # Remove existing attendees
-        if hasattr(vevent, 'attendee_list'):
+        if hasattr(vevent, "attendee_list"):
             for att in list(vevent.attendee_list):
                 vevent.remove(att)
-
-        # Add new attendees
         for attendee_email in attendees:
-            att = vevent.add('attendee')
-            att.value = f'mailto:{attendee_email}'
-            att.params['CN'] = [attendee_email]
-            att.params['CUTYPE'] = ['INDIVIDUAL']
-            att.params['ROLE'] = ['REQ-PARTICIPANT']
-            att.params['PARTSTAT'] = ['NEEDS-ACTION']
-            att.params['RSVP'] = ['TRUE']
+            att = vevent.add("attendee")
+            att.value = f"mailto:{attendee_email}"
+            att.params["CN"] = [attendee_email]
+            att.params["CUTYPE"] = ["INDIVIDUAL"]
+            att.params["ROLE"] = ["REQ-PARTICIPANT"]
+            att.params["PARTSTAT"] = ["NEEDS-ACTION"]
+            att.params["RSVP"] = ["TRUE"]
+        if attendees and not hasattr(vevent, "organizer"):
+            org = vevent.add("organizer")
+            org.value = f"mailto:{email}"
+            org.params["CN"] = [email]
 
-    # Save changes - use PUT request directly to avoid parent dependency
+    # Bump SEQUENCE so clients treat iTIP updates as newer than the original.
     try:
-        # Serialize the updated vCalendar data and send PUT request
+        if hasattr(vevent, "sequence"):
+            vevent.sequence.value = str(int(vevent.sequence.value) + 1)
+        else:
+            vevent.add("sequence").value = "1"
+    except Exception:
+        pass
+
+    try:
         updated_ical = event.vobject_instance.serialize()
-        event_client.put(event_id, updated_ical, {"Content-Type": "text/calendar; charset=utf-8"})
+        client.put(event_id, updated_ical, {"Content-Type": "text/calendar; charset=utf-8"})
     except Exception as e:
-        raise Exception(f"Error saving event: {str(e)}")
+        raise ValueError(f"Error saving event: {e}") from e
 
-    # Extract attendees for response
-    attendee_list = []
-    if hasattr(vevent, 'attendee_list'):
-        for att in vevent.attendee_list:
-            if hasattr(att, 'value'):
-                email_addr = str(att.value).replace('mailto:', '')
-                attendee_list.append(email_addr)
+    result = _vevent_to_dict(vevent, str(event.url), "")
+    result.pop("calendar", None)
 
-    # Send update notifications to attendees if attendees were modified
-    if attendees is not None and attendee_list:
-        event_summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else ""
-        event_start = vevent.dtstart.value.isoformat() if hasattr(vevent, 'dtstart') else start
-        event_end = vevent.dtend.value.isoformat() if hasattr(vevent, 'dtend') else end
-        event_location = str(vevent.location.value) if hasattr(vevent, 'location') else None
-
-        for attendee_email in attendee_list:
-            try:
-                _send_calendar_invitation(
-                    organizer_email=email,
-                    organizer_password=password,
-                    attendee_email=attendee_email,
-                    ical_data=updated_ical,
-                    summary=event_summary,
-                    start=event_start,
-                    end=event_end,
-                    location=event_location,
-                    method="REQUEST"  # Use REQUEST for updates too
-                )
-            except Exception as e:
-                # Log error but don't fail the update
-                import logging
-                logging.error(f"Failed to send update notification to {attendee_email}: {e}")
-
-    return {
-        "id": str(event.url),
-        "summary": str(vevent.summary.value) if hasattr(vevent, 'summary') else "",
-        "start": vevent.dtstart.value.isoformat() if hasattr(vevent, 'dtstart') else None,
-        "end": vevent.dtend.value.isoformat() if hasattr(vevent, 'dtend') else None,
-        "description": str(vevent.description.value) if hasattr(vevent, 'description') else "",
-        "location": str(vevent.location.value) if hasattr(vevent, 'location') else "",
-        "attendees": attendee_list,
-        "url": str(event.url)
-    }
+    if attendees is not None and result["attendees"]:
+        failed = _notify_attendees(
+            email,
+            password,
+            result["attendees"],
+            updated_ical,
+            result["summary"],
+            result["start"] or "",
+            result["end"] or "",
+            result["location"] or None,
+            "REQUEST",
+        )
+        if failed:
+            result["invitations_failed"] = failed
+    return result
 
 
-async def delete_event(context: Context, event_id: str) -> Dict[str, str]:
-    """
-    Delete a calendar event.
+def delete_event(event_id: str) -> dict[str, Any]:
+    email, password = require_auth()
+    client = _client_for_url(event_id, email, password)
+    event = caldav.CalendarObjectResource(client=client, url=event_id)
 
-    Args:
-        event_id: Event URL/ID to delete
-
-    Returns:
-        Confirmation message
-    """
-    email, password = require_auth(context)
-
-    # Create a client with the correct base URL for this specific event
-    # This prevents URL joining errors when event is on a different server (e.g., p72-caldav.icloud.com)
-    parsed = urlparse(event_id)
-    event_base_url = f"{parsed.scheme}://{parsed.netloc}"
-    event_client = caldav.DAVClient(url=event_base_url, username=email, password=password)
-
-    # Use CalendarObjectResource to handle full URLs correctly
-    event = caldav.CalendarObjectResource(client=event_client, url=event_id)
-
-    # Load event to get attendees before deleting
-    attendee_list = []
-    event_summary = ""
-    event_start = ""
-    event_end = ""
-    event_location = None
-    ical_data = None
-
+    snapshot: dict[str, Any] | None = None
+    ical_data: str | None = None
     try:
         event.load()
         vevent = event.vobject_instance.vevent
-
-        # Extract event details
-        event_summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else "Event"
-        if hasattr(vevent, 'dtstart'):
-            event_start = vevent.dtstart.value.isoformat() if hasattr(vevent.dtstart.value, 'isoformat') else str(vevent.dtstart.value)
-        if hasattr(vevent, 'dtend'):
-            event_end = vevent.dtend.value.isoformat() if hasattr(vevent.dtend.value, 'isoformat') else str(vevent.dtend.value)
-        if hasattr(vevent, 'location'):
-            event_location = str(vevent.location.value)
-
-        # Extract attendees
-        if hasattr(vevent, 'attendee_list'):
-            for att in vevent.attendee_list:
-                if hasattr(att, 'value'):
-                    email_addr = str(att.value).replace('mailto:', '')
-                    attendee_list.append(email_addr)
-
-        # Get the iCalendar data for CANCEL notifications
+        snapshot = _vevent_to_dict(vevent, event_id, "")
         ical_data = event.vobject_instance.serialize()
-
     except Exception as e:
-        # If we can't load the event, just delete it
-        import logging
-        logging.warning(f"Could not load event details before deletion: {e}")
+        logger.warning("Could not load event before deletion: %s", e)
 
-    # Delete the event
     event.delete()
 
-    # Send cancellation notifications to attendees
-    if attendee_list and ical_data:
-        for attendee_email in attendee_list:
-            try:
-                _send_calendar_invitation(
-                    organizer_email=email,
-                    organizer_password=password,
-                    attendee_email=attendee_email,
-                    ical_data=ical_data,
-                    summary=event_summary,
-                    start=event_start,
-                    end=event_end,
-                    location=event_location,
-                    method="CANCEL"
-                )
-            except Exception as e:
-                # Log error but don't fail the deletion
-                import logging
-                logging.error(f"Failed to send cancellation to {attendee_email}: {e}")
-
-    return {"status": "success", "message": f"Event {event_id} deleted"}
-
-
-async def search_events(
-    context: Context,
-    query: str,
-    calendar_id: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """
-    Search for events by text query.
-
-    Args:
-        query: Search text (matches summary and description)
-        calendar_id: Specific calendar URL/ID (optional)
-        start_date: Start date filter in ISO format (optional)
-        end_date: End date filter in ISO format (optional)
-
-    Returns:
-        List of matching events
-    """
-    # Get all events
-    events = await list_events(context, calendar_id, start_date, end_date)
-
-    # Filter by query
-    query_lower = query.lower()
-    filtered_events = [
-        event for event in events
-        if query_lower in event.get("summary", "").lower()
-        or query_lower in event.get("description", "").lower()
-        or query_lower in event.get("location", "").lower()
-    ]
-
-    return filtered_events
+    result: dict[str, Any] = {"status": "success", "message": f"Event {event_id} deleted"}
+    if snapshot:
+        result["summary"] = snapshot["summary"]
+        if snapshot["attendees"] and ical_data:
+            failed = _notify_attendees(
+                email,
+                password,
+                snapshot["attendees"],
+                ical_data,
+                snapshot["summary"],
+                snapshot["start"] or "",
+                snapshot["end"] or "",
+                snapshot["location"] or None,
+                "CANCEL",
+            )
+            if failed:
+                result["cancellations_failed"] = failed
+    return result

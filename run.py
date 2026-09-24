@@ -1,51 +1,18 @@
 #!/usr/bin/env python3
-"""
-Entry point for iCloud MCP Server.
+"""Entry point for the iCloud MCP server (thin wrapper around ``icloud_mcp.server:main``).
 
-Usage:
-    python run.py              # Run with stdio transport (local)
-    python run.py --http       # Run with HTTP/SSE transport (server)
+    python run.py                 # stdio transport (Claude Desktop / Claude Code)
+    python run.py --http          # Streamable HTTP on 0.0.0.0:8000/mcp
+    python run.py --help
 """
 
-import sys
-import argparse
 import os
+import sys
 
+# Allow running from a checkout without installing the package.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-def main():
-    parser = argparse.ArgumentParser(description="iCloud MCP Server")
-    parser.add_argument(
-        "--http",
-        action="store_true",
-        help="Run with HTTP/SSE transport instead of stdio"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="Port for HTTP server (default: from env or 8000)"
-    )
-
-    args = parser.parse_args()
-
-    # Import after parsing to allow --help without dependencies
-    try:
-        # Try installed package first (for Docker/production)
-        from icloud_mcp.server import mcp
-        from icloud_mcp.config import config
-    except ImportError:
-        # Fall back to development mode
-        from src.icloud_mcp.server import mcp
-        from src.icloud_mcp.config import config
-
-    if args.http:
-        port = args.port or int(os.environ.get("PORT", config.MCP_SERVER_PORT))
-        print(f"Starting iCloud MCP Server with Streamable HTTP on port {port}")
-        mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
-    else:
-        print("Starting iCloud MCP Server with stdio transport", file=sys.stderr)
-        mcp.run(transport="stdio")
-
+from icloud_mcp.server import main  # noqa: E402
 
 if __name__ == "__main__":
     main()
