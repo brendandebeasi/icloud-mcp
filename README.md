@@ -2,9 +2,9 @@
 
 [Model Context Protocol](https://modelcontextprotocol.io) server for iCloud. Gives Claude (Desktop, Code, claude.ai connectors) and any other MCP client full access to an iCloud account:
 
-- **Calendar** (CalDAV): list/search/create/update/delete events, recurring events (RRULE), IANA timezones, all-day events, iTIP invitations and cancellations by email.
-- **Contacts** (CardDAV): list/search/get/create/update/delete.
-- **Mail** (IMAP/SMTP): folders, listing, server-side search, full messages with attachments, attachment download, sending (HTML, attachments, threaded replies), move/delete/read flags.
+- **Calendar** (CalDAV): list/search/create/update/delete events, recurring events (RRULE), alerts (VALARM), IANA timezones, all-day events, iTIP invitations and cancellations by email.
+- **Contacts** (CardDAV): list/search/get/create/update/delete, including notes; labels (home/work/custom) survive updates.
+- **Mail** (IMAP/SMTP): folders, listing, server-side search, full messages with attachments, attachment download, sending (HTML, attachments, threaded replies), drafts, move/delete/read flags.
 
 Runs in two modes with the same code:
 
@@ -20,10 +20,10 @@ Runs in two modes with the same code:
 | `calendar_list_calendars` | Calendars with IDs; Reminders lists are flagged `read_only` |
 | `calendar_list_events` | Events in a date range, recurring series expanded per occurrence, sorted by start |
 | `calendar_search_events` | Text search over summary/description/location |
-| `calendar_create_event` | Create an event: timezone, all-day, `rrule`, attendees (invitations sent by email) |
-| `calendar_update_event` | Partial update; change timezone/recurrence; re-sends invitations when attendees change |
+| `calendar_create_event` | Create an event: timezone, all-day, `rrule`, `reminders` (minutes before start), attendees (invitations sent by email) |
+| `calendar_update_event` | Partial update; change timezone/recurrence/alerts; re-sends invitations when attendees change |
 | `calendar_delete_event` | Delete and email cancellations to attendees |
-| `contacts_list` / `contacts_search` / `contacts_get` | Read contacts (name, phones, emails, addresses, organization, title) |
+| `contacts_list` / `contacts_search` / `contacts_get` | Read contacts (name, phones, emails, addresses, organization, title, notes) |
 | `contacts_create` / `contacts_update` / `contacts_delete` | Write contacts |
 | `email_list_folders` | Folders with IMAP flags |
 | `email_list_messages` | Newest messages of a folder with readable `body_text`, `unread`, `has_attachments` |
@@ -31,6 +31,7 @@ Runs in two modes with the same code:
 | `email_get_message` / `email_get_messages` | Full message(s): headers, `body_text`, optional raw `body_html`, attachment list |
 | `email_get_attachment` | Download an attachment: save to a local directory (stdio) or return it inline |
 | `email_send` | Send mail: multiple recipients, CC/BCC, HTML with auto plain-text alternative, local file attachments, threaded reply (`reply_to_message_id`); copy stored in Sent |
+| `email_save_draft` | Same inputs as `email_send` but stores the message in Drafts for the user to review and send from any mail client |
 | `email_move` / `email_delete` | Move between folders; delete to Trash (`Deleted Messages`) or permanently |
 | `email_mark_read` / `email_mark_unread` | Toggle `\Seen` |
 
@@ -43,6 +44,9 @@ Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`) so client
 - **Recurring events**: `calendar_list_events` returns one entry per occurrence; update/delete apply to the whole series.
 - **Email bodies** are converted from HTML to readable text and truncated to `EMAIL_BODY_MAX_CHARS` (20 000) so newsletters do not flood the model context. `full_html=true` returns the raw HTML too.
 - **Attachments on disk** (`save_dir`, `attachment_paths`) are enabled by default in stdio mode and disabled in HTTP mode. Override with `ICLOUD_MCP_LOCAL_FILES` and restrict to a folder with `ICLOUD_MCP_LOCAL_FILES_ROOT`.
+- **Rich text** that users paste into event notes/locations or contact notes comes back from iCloud as HTML; it is rendered to readable text (`ICLOUD_HTML_MODE=text`, default) or passed through (`raw`).
+- **Tool groups** can be switched off per instance with `ICLOUD_ENABLED_CATEGORIES=calendar,contacts,email` (e.g. a read-only mail agent gets `email` only).
+- **Only iCloud hosts** are ever contacted with the account's credentials: calendar, event and contact URLs on any other host are rejected, and mail headers are validated against injection.
 
 ## Requirements
 
@@ -124,6 +128,17 @@ Checked in order:
 2. `Authorization: Basic base64(email:app-specific-password)`
 3. Environment `ICLOUD_EMAIL` / `ICLOUD_APP_SPECIFIC_PASSWORD` (single-user deployments)
 
+### Protecting the endpoint
+
+Set `MCP_AUTH_TOKEN` to a long random secret. Every MCP request must then carry it as `Authorization: Bearer <token>` or `X-MCP-Token: <token>` (`/health` stays open). Without a token the server logs a warning and **ignores the environment credentials over HTTP**, so an unprotected port can never hand out the operator's account; per-request credentials still work. Set `ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true` only if you really want an open endpoint bound to one account (e.g. on a private network). `docker-compose.yml` publishes the port on `127.0.0.1` only.
+
+```bash
+MCP_AUTH_TOKEN=$(openssl rand -hex 32) icloud-mcp --http
+claude mcp add --transport http icloud https://mcp.example.com/mcp \
+  -H "Authorization: Bearer <token>" \
+  -H "X-Apple-Email: you@icloud.com" -H "X-Apple-App-Specific-Password: xxxx-xxxx-xxxx-xxxx"
+```
+
 Example with Claude Code against a remote server:
 
 ```bash
@@ -145,6 +160,10 @@ All settings are environment variables (a `.env` file next to the checkout is lo
 | `EMAIL_MAX_ATTACHMENT_BYTES` | `20971520` | Outgoing attachment budget |
 | `ICLOUD_MCP_LOCAL_FILES` | stdio: on, HTTP: off | Allow reading/writing attachments on the server's disk |
 | `ICLOUD_MCP_LOCAL_FILES_ROOT` | – | Confine those files to a directory |
+| `MCP_AUTH_TOKEN` | – | Shared secret required on HTTP requests |
+| `ICLOUD_MCP_ALLOW_ENV_CREDENTIALS` | true with token, else false | Serve the env account over HTTP |
+| `ICLOUD_ENABLED_CATEGORIES` | `calendar,contacts,email` | Tool groups to expose |
+| `ICLOUD_HTML_MODE` | `text` | Rich text in event/contact fields: `text` or `raw` |
 | `MCP_TRANSPORT`, `PORT`, `MCP_SERVER_HOST`, `MCP_SERVER_PATH` | stdio, `8000`, `0.0.0.0`, `/mcp` | HTTP transport |
 | `LOG_LEVEL` | `INFO` | Logging (always to stderr, stdout is reserved for stdio) |
 
@@ -154,6 +173,8 @@ All settings are environment variables (a `.env` file next to the checkout is lo
 - **"iCloud rejected the credentials" / HTTP 401**: wrong app-specific password, or the Apple ID password was used.
 - **"IMAP login failed"** but calendar works: the Apple ID has no iCloud Mail address (Apple IDs created with a third-party email cannot use iCloud Mail).
 - **Events land at the wrong time**: set `DEFAULT_TIMEZONE` or pass `timezone` explicitly.
+- **HTTP 401 `unauthorized`** from the server itself: `MCP_AUTH_TOKEN` is set and the request did not carry it.
+- **"Refusing to use ... URL on untrusted host"**: an ID was not one returned by the list tools; pass the URL verbatim.
 - **Server logs**: everything goes to stderr; in Claude Desktop see Help → Show Logs.
 
 ## Development
@@ -174,7 +195,8 @@ src/icloud_mcp/
 ├── calendar.py    # CalDAV operations, RRULE/timezone handling, iTIP mail
 ├── contacts.py    # CardDAV operations
 ├── mail.py        # IMAP/SMTP operations
-└── mail_utils.py  # MIME parsing, HTML→text, attachments, special folders
+├── mail_utils.py  # MIME parsing, HTML→text, attachments, special folders, header validation
+└── urls.py        # iCloud host allow-list for calendar/contact URLs
 ```
 
 ## License

@@ -169,3 +169,47 @@ def test_create_event_rejects_mixed_and_reversed(monkeypatch):
         calendar.create_event("x", "2025-06-02", "2025-06-02T10:00:00")
     with pytest.raises(ValueError):
         calendar.create_event("x", "2025-06-02T11:00:00", "2025-06-02T10:00:00")
+
+
+ALARM_SAMPLE = SAMPLE.replace(
+    "END:VEVENT",
+    "BEGIN:VALARM\nACTION:DISPLAY\nDESCRIPTION:Reminder\nTRIGGER:-PT1H\nEND:VALARM\n"
+    "BEGIN:VALARM\nACTION:DISPLAY\nDESCRIPTION:Reminder\nTRIGGER;RELATED=START:PT9H\nEND:VALARM\nEND:VEVENT",
+)
+
+
+def test_alarm_read_back():
+    vevent = vobject.readOne(ALARM_SAMPLE).vevent
+    assert calendar._alarm_minutes(vevent) == [60, -540]
+    assert _vevent_to_dict(vevent, "u", "c")["reminders"] == [60, -540]
+
+
+def test_alarm_lines_and_replace():
+    assert calendar._alarm_lines(15) == [
+        "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Reminder", "TRIGGER:-PT15M", "END:VALARM"
+    ]
+    assert calendar._alarm_lines(-540)[3] == "TRIGGER:PT540M"
+    cal = vobject.readOne(ALARM_SAMPLE)
+    for alarm in list(cal.vevent.valarm_list):
+        cal.vevent.remove(alarm)
+    calendar._add_alarm(cal.vevent, 10)
+    assert calendar._alarm_minutes(cal.vevent) == [10]
+    assert "TRIGGER:-PT10M" in cal.serialize()
+
+
+def test_create_event_with_reminders(monkeypatch):
+    fake = _FakeCalendar()
+    monkeypatch.setattr(calendar, "require_auth", lambda: ("me@icloud.com", "pw"))
+    monkeypatch.setattr(calendar, "_get_caldav_client", lambda e, p: object())
+    monkeypatch.setattr(calendar, "_resolve_calendar", lambda client, cid, e, p: fake)
+    result = calendar.create_event("x", "2025-06-02T10:00:00", "2025-06-02T11:00:00", reminders=[60, 0])
+    assert fake.ical.count("BEGIN:VALARM") == 2 and "TRIGGER:-PT60M" in fake.ical and "TRIGGER:PT0M" in fake.ical
+    assert result["reminders"] == [60, 0]
+
+
+def test_description_html_rendered_to_text(monkeypatch):
+    monkeypatch.setattr(calendar.config, "HTML_MODE", "text")
+    cal = vobject.readOne(SAMPLE)
+    cal.vevent.add("description").value = "Park<br>2803 Ave<br><a href='x'>map</a>"
+    data = _vevent_to_dict(cal.vevent, "u", "c")
+    assert "<br>" not in data["description"] and "2803 Ave" in data["description"]

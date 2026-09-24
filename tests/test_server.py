@@ -47,10 +47,11 @@ class FakeIMAP:
             ((b"\\HasNoChildren",), b"/", "INBOX"),
             ((b"\\HasNoChildren", b"\\Sent"), b"/", "Sent Messages"),
             ((b"\\HasNoChildren", b"\\Trash"), b"/", "Deleted Messages"),
+            ((b"\\HasNoChildren", b"\\Drafts"), b"/", "Drafts"),
         ]
 
     def find_special_folder(self, flag):
-        return {b"\\Sent": "Sent Messages", b"\\Trash": "Deleted Messages"}.get(flag)
+        return {b"\\Sent": "Sent Messages", b"\\Trash": "Deleted Messages", b"\\Drafts": "Drafts"}.get(flag)
 
     def has_capability(self, cap):
         return cap in {"MOVE", "UIDPLUS"}
@@ -230,3 +231,28 @@ def test_instructions_and_annotations():
     assert tools["email_delete"].annotations.destructive_hint is True
     assert tools["calendar_list_events"].annotations.read_only_hint is True
     assert "context" not in tools["calendar_list_events"].input_schema.get("properties", {})
+
+
+def test_save_draft(fake_imap):
+    result = _call(
+        "email_save_draft", subject="Draft subj", body="text", to="x@example.com", reply_to_message_id="1"
+    ).structured_content
+    assert result["folder"] == "Drafts" and result["to"] == ["x@example.com"]
+    folder, raw = fake_imap.appended
+    assert folder == "Drafts"
+    assert b"In-Reply-To: <first@example.com>" in raw
+
+
+def test_send_rejects_header_injection(fake_imap, monkeypatch):
+    called = []
+    monkeypatch.setattr(mail_module, "get_smtp_client", lambda u, p: called.append(1))
+    result = _call("email_send", to="x@example.com\r\nBcc: v@example.com", subject="s", body="b")
+    assert result.is_error and "line breaks" in result.content[0].text
+    result = _call("email_send", to="x@example.com", subject="s\nX: y", body="b")
+    assert result.is_error
+    assert not called
+
+
+def test_foreign_event_url_is_rejected():
+    result = _call("calendar_delete_event", event_id="https://evil.example/e.ics")
+    assert result.is_error and "untrusted host" in result.content[0].text

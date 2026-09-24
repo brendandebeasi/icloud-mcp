@@ -2,16 +2,18 @@
 
 import logging
 import uuid
-import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import urljoin
 
 import requests
 import vobject
+from defusedxml import ElementTree as ET
 from requests.auth import HTTPBasicAuth
 
 from .auth import require_auth
 from .config import config
+from .mail_utils import clean_rich_text
+from .urls import ensure_icloud_url
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,7 @@ def _vcard_to_dict(vcard: Any, url: str) -> dict[str, Any]:
         "addresses": [],
         "organization": "",
         "title": text("title"),
+        "notes": clean_rich_text(text("note")),
     }
     org = getattr(vcard, "org", None)
     if org is not None and org.value:
@@ -192,6 +195,7 @@ def list_contacts(limit: int | None = None) -> list[dict[str, Any]]:
 
 
 def get_contact(contact_id: str) -> dict[str, Any]:
+    contact_id = ensure_icloud_url(contact_id, "contact")
     email, password = require_auth()
     session = _get_carddav_session(email, password)
     response = session.get(contact_id, timeout=TIMEOUT)
@@ -206,21 +210,14 @@ def _apply_fields(
     addresses: list[str] | None,
     organization: str | None,
     title: str | None,
+    notes: str | None = None,
 ) -> None:
+    """Apply partial updates. List fields replace existing values; entries whose value is
+    unchanged keep their original parameters (e.g. TYPE=HOME, custom iOS labels)."""
     if phones is not None:
-        for tel in list(getattr(vcard, "tel_list", []) or []):
-            vcard.remove(tel)
-        for phone in phones:
-            tel = vcard.add("tel")
-            tel.value = phone
-            tel.type_param = "CELL"
+        _replace_entries(vcard, "tel", phones, default_type="CELL")
     if emails is not None:
-        for em in list(getattr(vcard, "email_list", []) or []):
-            vcard.remove(em)
-        for address in emails:
-            em = vcard.add("email")
-            em.value = address
-            em.type_param = "INTERNET"
+        _replace_entries(vcard, "email", emails, default_type="INTERNET")
     if addresses is not None:
         for adr in list(getattr(vcard, "adr_list", []) or []):
             vcard.remove(adr)
@@ -237,6 +234,30 @@ def _apply_fields(
             vcard.title.value = title
         else:
             vcard.add("title").value = title
+    if notes is not None:
+        if hasattr(vcard, "note"):
+            vcard.note.value = notes
+        else:
+            vcard.add("note").value = notes
+
+
+def _normalized(value: str) -> str:
+    return "".join(ch for ch in str(value).lower() if ch not in " -()\u00a0")
+
+
+def _replace_entries(vcard: Any, prop: str, values: list[str], default_type: str) -> None:
+    existing = list(getattr(vcard, f"{prop}_list", []) or [])
+    params_by_value = {_normalized(item.value): dict(item.params) for item in existing if item.value}
+    for item in existing:
+        vcard.remove(item)
+    for value in values:
+        entry = vcard.add(prop)
+        entry.value = value
+        preserved = params_by_value.get(_normalized(value))
+        if preserved:
+            entry.params.update(preserved)
+        else:
+            entry.type_param = default_type
 
 
 def _split_name(name: str) -> Any:
@@ -253,6 +274,7 @@ def create_contact(
     addresses: list[str] | None = None,
     organization: str | None = None,
     title: str | None = None,
+    notes: str | None = None,
 ) -> dict[str, Any]:
     email, password = require_auth()
     session = _get_carddav_session(email, password)
@@ -263,7 +285,7 @@ def create_contact(
     vcard.add("n").value = _split_name(name)
     unique_id = str(uuid.uuid4())
     vcard.add("uid").value = unique_id
-    _apply_fields(vcard, phones, emails, addresses, organization, title)
+    _apply_fields(vcard, phones, emails, addresses, organization, title, notes)
 
     contact_url = f"{addressbook_url}{unique_id}.vcf"
     response = session.put(
@@ -284,7 +306,9 @@ def update_contact(
     addresses: list[str] | None = None,
     organization: str | None = None,
     title: str | None = None,
+    notes: str | None = None,
 ) -> dict[str, Any]:
+    contact_id = ensure_icloud_url(contact_id, "contact")
     email, password = require_auth()
     session = _get_carddav_session(email, password)
 
@@ -300,7 +324,7 @@ def update_contact(
             vcard.add("fn").value = name
         if hasattr(vcard, "n"):
             vcard.n.value = _split_name(name)
-    _apply_fields(vcard, phones, emails, addresses, organization, title)
+    _apply_fields(vcard, phones, emails, addresses, organization, title, notes)
 
     headers = {"Content-Type": "text/vcard; charset=utf-8"}
     if etag:
@@ -313,6 +337,7 @@ def update_contact(
 
 
 def delete_contact(contact_id: str) -> dict[str, str]:
+    contact_id = ensure_icloud_url(contact_id, "contact")
     email, password = require_auth()
     session = _get_carddav_session(email, password)
     response = session.delete(contact_id, timeout=TIMEOUT)
@@ -328,6 +353,7 @@ def search_contacts(query: str, limit: int | None = None) -> list[dict[str, Any]
         haystack = [
             contact.get("name", ""),
             contact.get("organization", ""),
+            contact.get("notes", ""),
             *contact.get("emails", []),
         ]
         phone_hit = bool(digits) and any(
